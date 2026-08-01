@@ -1,5 +1,6 @@
 mod capture;
 mod discovery;
+mod input;
 mod niri;
 mod render;
 mod viewer;
@@ -74,6 +75,10 @@ enum Command {
         /// Initial vertical center from 0.0 (top) to 1.0 (bottom).
         #[arg(long, default_value_t = 0.5)]
         center_y: f32,
+
+        /// Allow mouse clicks after explicitly arming control with `i`.
+        #[arg(long)]
+        control: bool,
     },
 }
 
@@ -97,7 +102,8 @@ fn main() -> Result<()> {
             zoom,
             center_x,
             center_y,
-        } => view(discovered, output, zoom, center_x, center_y),
+            control,
+        } => view(discovered, output, zoom, center_x, center_y, control),
     }
 }
 
@@ -107,16 +113,20 @@ fn view(
     zoom: f32,
     center_x: f32,
     center_y: f32,
+    control: bool,
 ) -> Result<()> {
     let display = discovered
         .wayland_display
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("could not discover WAYLAND_DISPLAY"))?;
     let output = resolve_output(&discovered, output)?;
+    let geometry = niri::Client::connect(&discovered.socket_path)?.output_geometry(&output)?;
     viewer::run(
         &discovered.runtime_dir,
         display,
         &output,
+        geometry,
+        control,
         render::Viewport {
             zoom,
             center_x,

@@ -69,4 +69,19 @@ nix develop --command cargo run --release -- view
 - `0`：返回 1× 全景并居中；
 - `c`：保持倍率并回到中心；
 - `r`：重新捕获当前画面；
+- 鼠标左键：预览该 terminal cell 对应的 output 逻辑坐标；
 - `q`、Esc、Ctrl-C、Ctrl-D：退出。
+
+鼠标事件使用终端的 SGR mouse protocol。tmux 会把事件转换成 pane 内坐标，因此 pane
+在 window 中的位置不需要额外补偿；图像右侧/下方留白和状态栏中的点击会被忽略。
+
+需要实际控制桌面时显式启用 control mode：
+
+```console
+nix develop --command cargo run --release -- view --control
+```
+
+control mode 启动时仍是 `CONTROL:OFF`。按 `i` 切换 armed/disarmed；只有
+`CONTROL:ARMED` 状态下的左键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
+点击后会自动刷新一帧。该路径使用 Wayland 绝对坐标，不依赖 `ydotool`、`/dev/uinput`
+或鼠标加速度。当前输入映射仅支持 niri 的 `Normal` output transform。

@@ -31,6 +31,7 @@ pub struct RenderedFrame {
     pub bytes: Vec<u8>,
     pub cols: u16,
     pub rows: u16,
+    pub sample_height: u16,
     pub viewport: ViewportRect,
 }
 
@@ -85,6 +86,7 @@ pub fn render_half_blocks_viewport(
         bytes,
         cols: sample_width as u16,
         rows: rows as u16,
+        sample_height: sample_height as u16,
         viewport,
     })
 }

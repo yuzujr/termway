@@ -20,6 +20,17 @@ pub struct Snapshot {
     pub focused_window: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputGeometry {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+    pub transform: String,
+}
+
 impl Client {
     pub fn connect(path: &Path) -> Result<Self> {
         let stream = UnixStream::connect(path)
@@ -101,6 +112,60 @@ impl Client {
             .map(Some)
             .context("niri FocusedOutput response has no string name")
     }
+
+    pub fn output_geometry(&mut self, name: &str) -> Result<OutputGeometry> {
+        let reply = self.request("Outputs")?;
+        let outputs = variant(&reply, "Outputs")?
+            .as_object()
+            .context("niri Outputs response is not an object")?;
+        let output = outputs
+            .get(name)
+            .with_context(|| format!("niri has no output named {name}"))?;
+        parse_output_geometry(output)
+    }
+}
+
+fn parse_output_geometry(output: &Value) -> Result<OutputGeometry> {
+    let name = output
+        .get("name")
+        .and_then(Value::as_str)
+        .context("niri output has no string name")?
+        .to_owned();
+    let logical = output
+        .get("logical")
+        .context("niri output is disabled and has no logical geometry")?;
+    Ok(OutputGeometry {
+        name,
+        x: json_i32(logical, "x")?,
+        y: json_i32(logical, "y")?,
+        width: json_u32(logical, "width")?,
+        height: json_u32(logical, "height")?,
+        scale: logical
+            .get("scale")
+            .and_then(Value::as_f64)
+            .context("niri output logical scale is not a number")?,
+        transform: logical
+            .get("transform")
+            .and_then(Value::as_str)
+            .context("niri output logical transform is not a string")?
+            .to_owned(),
+    })
+}
+
+fn json_i32(value: &Value, field: &str) -> Result<i32> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .and_then(|number| i32::try_from(number).ok())
+        .with_context(|| format!("niri output logical {field} is not an i32"))
+}
+
+fn json_u32(value: &Value, field: &str) -> Result<u32> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+        .with_context(|| format!("niri output logical {field} is not a u32"))
 }
 
 pub fn probe_event_stream(path: &Path, timeout: Duration) -> Result<Value> {
@@ -199,6 +264,33 @@ mod tests {
         assert_eq!(
             event_name(&json!({"WindowsChanged": {"windows": []}})),
             "WindowsChanged"
+        );
+    }
+
+    #[test]
+    fn parses_output_geometry() {
+        let output = json!({
+            "name": "eDP-1",
+            "logical": {
+                "x": -1920,
+                "y": 0,
+                "width": 2048,
+                "height": 1280,
+                "scale": 1.25,
+                "transform": "Normal"
+            }
+        });
+        assert_eq!(
+            parse_output_geometry(&output).unwrap(),
+            OutputGeometry {
+                name: "eDP-1".into(),
+                x: -1920,
+                y: 0,
+                width: 2048,
+                height: 1280,
+                scale: 1.25,
+                transform: "Normal".into(),
+            }
         );
     }
 }
