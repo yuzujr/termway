@@ -47,6 +47,11 @@ const KITTY_MAX_HEIGHT: u32 = 1080;
 const KITTY_TILE_SIZE: u32 = 128;
 const KITTY_REFINE_DELAY: Duration = Duration::from_millis(120);
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+// Keep tmux's eager pane reader from building a multi-megabyte client backlog. This is below a
+// 50 Mbit/s relay while remaining fast enough to deliver a typical UI frame in well under a
+// second. Direct SSH already gets real backpressure from its channel and is left unrestricted.
+const TMUX_GRAPHICS_BYTES_PER_SECOND: f64 = 4.0 * 1024.0 * 1024.0;
+const TMUX_GRAPHICS_BURST_BYTES: f64 = 16.0 * 1024.0;
 
 pub struct RunOptions<'a> {
     pub control: bool,
@@ -1041,10 +1046,11 @@ struct OutputPump {
     active: Option<OutputSegment>,
     control: VecDeque<Vec<u8>>,
     graphics: VecDeque<Vec<u8>>,
+    graphics_limiter: Option<RateLimiter>,
 }
 
 impl OutputPump {
-    fn new(stdout: &Stdout) -> Result<Self> {
+    fn new(stdout: &Stdout, pace_graphics: bool) -> Result<Self> {
         let original_flags = fcntl_getfl(stdout).context("cannot read stdout flags")?;
         fcntl_setfl(stdout, original_flags | OFlags::NONBLOCK)
             .context("cannot enable non-blocking stdout")?;
@@ -1053,6 +1059,13 @@ impl OutputPump {
             active: None,
             control: VecDeque::new(),
             graphics: VecDeque::new(),
+            graphics_limiter: pace_graphics.then(|| {
+                RateLimiter::new(
+                    TMUX_GRAPHICS_BYTES_PER_SECOND,
+                    TMUX_GRAPHICS_BURST_BYTES,
+                    Instant::now(),
+                )
+            }),
         })
     }
 
@@ -1108,9 +1121,29 @@ impl OutputPump {
         let Some(active) = &mut self.active else {
             return Ok(false);
         };
-        match rustix::io::write(stdout, &active.bytes[active.offset..]) {
+        let remaining = &active.bytes[active.offset..];
+        let allowance = if active.kind == OutputKind::Graphics {
+            self.graphics_limiter
+                .as_mut()
+                .map_or(remaining.len(), |limiter| {
+                    limiter.allowance(remaining.len(), Instant::now())
+                })
+        } else {
+            remaining.len()
+        };
+        if allowance == 0 {
+            return Ok(false);
+        }
+        match rustix::io::write(stdout, &remaining[..allowance]) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
-            Ok(written) => active.offset += written,
+            Ok(written) => {
+                active.offset += written;
+                if active.kind == OutputKind::Graphics
+                    && let Some(limiter) = &mut self.graphics_limiter
+                {
+                    limiter.consume(written);
+                }
+            }
             Err(Errno::AGAIN) => return Ok(false),
             Err(Errno::INTR) => return Ok(false),
             Err(error) => {
@@ -1134,6 +1167,36 @@ impl OutputPump {
             .take()
             .map(|active| active.bytes[active.offset..].to_vec())
             .filter(|bytes| !bytes.is_empty())
+    }
+}
+
+struct RateLimiter {
+    bytes_per_second: f64,
+    burst: f64,
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl RateLimiter {
+    fn new(bytes_per_second: f64, burst: f64, now: Instant) -> Self {
+        Self {
+            bytes_per_second,
+            burst,
+            tokens: burst,
+            updated_at: now,
+        }
+    }
+
+    fn allowance(&mut self, requested: usize, now: Instant) -> usize {
+        self.tokens = (self.tokens
+            + now.duration_since(self.updated_at).as_secs_f64() * self.bytes_per_second)
+            .min(self.burst);
+        self.updated_at = now;
+        requested.min(self.tokens.floor() as usize)
+    }
+
+    fn consume(&mut self, bytes: usize) {
+        self.tokens = (self.tokens - bytes as f64).max(0.0);
     }
 }
 
@@ -1174,7 +1237,8 @@ impl Terminal {
             return Err(error).context("cannot initialize the interactive terminal");
         }
         let output_pump = if kitty.is_some() {
-            match OutputPump::new(&stdout) {
+            let pace_graphics = kitty.as_ref().is_some_and(kitty::Renderer::is_tmux);
+            match OutputPump::new(&stdout, pace_graphics) {
                 Ok(output) => Some(output),
                 Err(error) => {
                     let _ = stdout.execute(Show);
@@ -1988,6 +2052,7 @@ mod tests {
             active: None,
             control: VecDeque::new(),
             graphics: VecDeque::new(),
+            graphics_limiter: None,
         };
         output.enqueue_graphics(vec![b"graphics-1".to_vec(), b"graphics-2".to_vec()]);
         output.enqueue_control(b"control".to_vec());
@@ -2600,5 +2665,23 @@ mod tests {
         assert_eq!(fit_status("abc", 5), "abc  ");
         assert_eq!(fit_status("abcdef", 3), "abc");
         assert_eq!(fit_status("你好", 1), "你");
+    }
+
+    #[test]
+    fn graphics_rate_limiter_bounds_initial_burst_and_refills() {
+        let started = Instant::now();
+        let mut limiter = RateLimiter::new(1_000.0, 100.0, started);
+        assert_eq!(limiter.allowance(1_000, started), 100);
+        limiter.consume(100);
+        assert_eq!(limiter.allowance(1_000, started), 0);
+        assert_eq!(
+            limiter.allowance(1_000, started + Duration::from_millis(25)),
+            25
+        );
+        limiter.consume(25);
+        assert_eq!(
+            limiter.allowance(1_000, started + Duration::from_millis(225)),
+            100
+        );
     }
 }

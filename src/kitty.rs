@@ -162,6 +162,10 @@ impl Selection {
 }
 
 impl Renderer {
+    pub fn is_tmux(&self) -> bool {
+        self.transport == Transport::Tmux
+    }
+
     pub fn has_atlas(&self) -> bool {
         self.active_atlas.is_some()
     }

@@ -82,7 +82,9 @@ modeline 会显示 `GFX:KITTY` 或 `GFX:ANSI`。
 Kitty 协议输出使用非阻塞 PTY 和完整协议单元队列；每个约 4 KiB 的 APC 或一行 placeholder
 发送后都会重新处理终端输入。上一帧仍在发送时不会继续堆积 damage 帧，只记录一次最新画面
 重绘请求。modeline、echo 和输入状态输出优先于图像队列，退出时最多补完当前协议单元，随后
-丢弃尚未发送的图像，避免低速 tmux/SSH 链路阻塞控制。
+丢弃尚未发送的图像，避免低速 tmux/SSH 链路阻塞控制。tmux 会主动吸收 pane PTY 输出、无法
+把真实 client 背压传回程序，因此 termway 在 tmux 下把图像输出平滑限制在约 32 Mbit/s、只
+允许 16 KiB burst；控制输出不受此限制，避免它排在 tmux 已缓存的数 MB 图像之后。
 
 可以显式选择或排错：
 
