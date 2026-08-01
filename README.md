@@ -69,7 +69,7 @@ nix develop --command cargo run --release -- view
 - `0`：返回 1× 全景并居中；
 - `c`：保持倍率并回到中心；
 - `r`：重新捕获当前画面；
-- 鼠标左键：预览该 terminal cell 对应的 output 逻辑坐标；
+- 鼠标左键：向点击位置移动 viewport，并放大一级；
 - 鼠标滚轮或触控板上下滚动：垂直平移 viewport；
 - 触控板左右滚动：水平平移 viewport（取决于终端是否发送水平滚动事件）；
 - `q`、Esc、Ctrl-C、Ctrl-D：退出。
@@ -77,14 +77,23 @@ nix develop --command cargo run --release -- view
 鼠标事件使用终端的 SGR mouse protocol。tmux 会把事件转换成 pane 内坐标，因此 pane
 在 window 中的位置不需要额外补偿；图像右侧/下方留白和状态栏中的点击会被忽略。
 
-需要实际控制桌面时显式启用 control mode：
+viewer 有两个互斥交互模式，鼠标控制则是独立的安全开关：
+
+| mode line | 键盘 | 左键 |
+| --- | --- | --- |
+| `NAV \| READ-ONLY` | termway 导航命令 | 渐进聚焦并放大 |
+| `NAV \| MOUSE:OFF` | termway 导航命令 | 渐进聚焦并放大 |
+| `INPUT \| MOUSE:OFF` | 发送给远端窗口 | 渐进聚焦并放大 |
+| `NAV/INPUT \| MOUSE:ON` | 取决于 NAV/INPUT | 点击远端桌面 |
+
+`--control` 只授予远端输入能力，并不是一种运行模式：
 
 ```console
 nix develop --command cargo run --release -- view --control
 ```
 
-control mode 启动时仍是 `CONTROL:OFF`。按 `i` 切换 armed/disarmed；只有
-`CONTROL:ARMED` 状态下的左键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
+启动时为 `[NAV | MOUSE:OFF]`。在 NAV 中按 `i` 切换 `MOUSE:OFF/ON`；只有
+`MOUSE:ON` 状态下的左键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
 点击后会自动刷新一帧。该路径使用 Wayland 绝对坐标，不依赖 `ydotool`、`/dev/uinput`
 或鼠标加速度。当前输入映射仅支持 niri 的 `Normal` output transform。
 
@@ -94,6 +103,7 @@ keyboard 发送给当前聚焦的远端窗口。输入模式使用 `Ctrl-\` 作�
 - `Ctrl-\ t`：返回 command mode；
 - `Ctrl-\ r`：刷新画面；
 - `Ctrl-\ q`：退出 termway；
+- `Ctrl-\ i`：切换 `MOUSE:OFF/ON`；
 - 连按两次 `Ctrl-\`：向远端发送一次 `Ctrl-\`。
 
 在 legacy terminal keyboard protocol 中，`Ctrl-\` 与 `Ctrl-4` 都编码为 `0x1c`，

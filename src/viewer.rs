@@ -35,6 +35,7 @@ const SCROLL_STEP_SCALE: f32 = 0.25;
 const MAX_SCROLL_STEPS_PER_FRAME: i32 = 4;
 const AXIS_SWITCH_THRESHOLD: i32 = 2;
 const AUTO_REFRESH_DELAY: Duration = Duration::from_millis(250);
+const CLICK_FOCUS_FRACTION: f32 = 0.4;
 
 pub fn run(
     runtime_dir: &Path,
@@ -154,7 +155,7 @@ pub fn run(
                 }
                 if let Some(point) = map_left_click(mouse, layout, &output_geometry) {
                     let mut frame_changed = false;
-                    if state.control && state.armed {
+                    if state.control && state.mouse_armed {
                         if let Some(pointer) = &pointer {
                             match pointer.click(
                                 point.local_x,
@@ -185,19 +186,13 @@ pub fn run(
                                 }
                             }
                         }
-                    } else {
+                    } else if state.zoom_toward(point, layout) == Effect::Redraw {
                         state.message(format!(
-                            "preview {}:{} (global {},{}); {}",
-                            point.local_x,
-                            point.local_y,
-                            point.global_x,
-                            point.global_y,
-                            if state.control {
-                                "press i to arm"
-                            } else {
-                                "view-only"
-                            }
+                            "Focused toward {}:{}; {:.2}x",
+                            point.local_x, point.local_y, state.viewport.zoom
                         ));
+                        layout = terminal.draw(&frame, output_name, &state)?;
+                        continue;
                     }
                     if frame_changed {
                         layout = terminal.draw(&frame, output_name, &state)?;
@@ -218,11 +213,17 @@ struct ViewerState {
     viewport: Viewport,
     message: Option<EchoMessage>,
     control: bool,
-    armed: bool,
-    keyboard_input: bool,
+    mouse_armed: bool,
+    mode: InteractionMode,
     prefix_pending: bool,
     auto_refresh_at: Option<Instant>,
     scroll_gesture: ScrollGesture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionMode {
+    Nav,
+    Input,
 }
 
 #[derive(Debug)]
@@ -249,8 +250,8 @@ impl ViewerState {
             viewport,
             message: None,
             control,
-            armed: false,
-            keyboard_input: false,
+            mouse_armed: false,
+            mode: InteractionMode::Nav,
             prefix_pending: false,
             auto_refresh_at: None,
             scroll_gesture: ScrollGesture::default(),
@@ -260,7 +261,7 @@ impl ViewerState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Effect {
-        if self.keyboard_input {
+        if self.mode == InteractionMode::Input {
             return self.handle_input_key(key);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -273,15 +274,15 @@ impl ViewerState {
             KeyCode::Char('q') | KeyCode::Esc => Effect::Quit,
             KeyCode::Char('r') => Effect::Refresh,
             KeyCode::Char('t') if self.control => {
-                self.keyboard_input = true;
+                self.mode = InteractionMode::Input;
                 self.prefix_pending = false;
                 self.message("Keyboard input enabled; use C-\\ t to return");
                 Effect::Chrome
             }
             KeyCode::Char('i') if self.control => {
-                self.armed = !self.armed;
-                self.message(if self.armed {
-                    "CONTROL ARMED: left click will control the desktop"
+                self.mouse_armed = !self.mouse_armed;
+                self.message(if self.mouse_armed {
+                    "Mouse control armed"
                 } else {
                     "Control disarmed"
                 });
@@ -317,12 +318,21 @@ impl ViewerState {
             }
             return match key.code {
                 KeyCode::Char('t') => {
-                    self.keyboard_input = false;
+                    self.mode = InteractionMode::Nav;
                     self.message("Keyboard input disabled");
                     Effect::Chrome
                 }
                 KeyCode::Char('q') => Effect::Quit,
                 KeyCode::Char('r') => Effect::Refresh,
+                KeyCode::Char('i') => {
+                    self.mouse_armed = !self.mouse_armed;
+                    self.message(if self.mouse_armed {
+                        "Mouse control armed"
+                    } else {
+                        "Mouse control disarmed"
+                    });
+                    Effect::Chrome
+                }
                 _ => {
                     self.error(format!("Undefined prefix key: C-\\ {:?}", key.code));
                     Effect::Chrome
@@ -458,6 +468,24 @@ impl ViewerState {
         let margin = 0.5 / self.viewport.zoom;
         self.viewport.center_x = self.viewport.center_x.clamp(margin, 1.0 - margin);
         self.viewport.center_y = self.viewport.center_y.clamp(margin, 1.0 - margin);
+    }
+
+    fn zoom_toward(&mut self, target: LogicalPoint, layout: DrawLayout) -> Effect {
+        let previous = self.viewport;
+        let target_x = (target.source_x as f32 + 0.5) / layout.source_width as f32;
+        let target_y = (target.source_y as f32 + 0.5) / layout.source_height as f32;
+        self.viewport.zoom = (self.viewport.zoom * ZOOM_STEP).min(MAX_ZOOM);
+        self.viewport.center_x += (target_x - self.viewport.center_x) * CLICK_FOCUS_FRACTION;
+        self.viewport.center_y += (target_y - self.viewport.center_y) * CLICK_FOCUS_FRACTION;
+        self.clamp_center();
+        if self.viewport.zoom == previous.zoom
+            && self.viewport.center_x == previous.center_x
+            && self.viewport.center_y == previous.center_y
+        {
+            Effect::None
+        } else {
+            Effect::Redraw
+        }
     }
 
     fn handle_scroll_batch(
@@ -701,29 +729,29 @@ impl Terminal {
     ) -> Result<()> {
         let (cols, rows) = crossterm::terminal::size()?;
         let mode_y = rows.saturating_sub(2);
-        let mode = if !state.control {
-            "VIEW"
-        } else if state.keyboard_input && state.armed {
-            "INPUT:MOUSE"
-        } else if state.keyboard_input {
-            "INPUT"
-        } else if state.armed {
-            "CONTROL:ARMED"
-        } else {
-            "CONTROL:OFF"
+        let mode = match state.mode {
+            InteractionMode::Nav => "NAV",
+            InteractionMode::Input => "INPUT",
         };
-        let input_hint = if state.keyboard_input {
+        let mouse = if !state.control {
+            "READ-ONLY"
+        } else if state.mouse_armed {
+            "MOUSE:ON"
+        } else {
+            "MOUSE:OFF"
+        };
+        let input_hint = if state.mode == InteractionMode::Input {
             "C-\\ prefix"
         } else if !state.control {
-            "click inspect"
-        } else if state.armed {
+            "click focus"
+        } else if state.mouse_armed {
             "i disarm"
         } else {
-            "i arm"
+            "click focus  i arm"
         };
         let mode_line = fit_status(
             &format!(
-                " - Termway: {output_name}  [{mode}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  r refresh  q quit ",
+                " - Termway: {output_name}  [{mode} | {mouse}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  r refresh  q quit ",
                 state.viewport.zoom,
                 state.viewport.center_x * 100.0,
                 state.viewport.center_y * 100.0,
@@ -732,7 +760,7 @@ impl Terminal {
             ),
             cols as usize,
         );
-        let signature = (mode_y, mode_line.clone(), state.armed);
+        let signature = (mode_y, mode_line.clone(), state.mouse_armed);
         if self.last_mode_line.as_ref() == Some(&signature) {
             return Ok(());
         }
@@ -740,7 +768,7 @@ impl Terminal {
             stdout.queue(MoveTo(0, mode_y))?;
             stdout.queue(ResetColor)?;
             stdout.queue(SetAttribute(Attribute::Reverse))?;
-            if state.armed {
+            if state.mouse_armed {
                 stdout.queue(SetAttribute(Attribute::Bold))?;
             }
             stdout.queue(Print(mode_line))?;
@@ -905,6 +933,8 @@ struct DrawLayout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LogicalPoint {
+    source_x: u32,
+    source_y: u32,
     local_x: u32,
     local_y: u32,
     global_x: i64,
@@ -930,13 +960,21 @@ fn map_left_click(
         + sample_x / f64::from(layout.cols) * f64::from(layout.viewport.width);
     let physical_y = f64::from(layout.viewport.y)
         + sample_y / f64::from(layout.sample_height) * f64::from(layout.viewport.height);
-    let local_x = (physical_x / f64::from(layout.source_width) * f64::from(output.width))
+    let source_x = physical_x
+        .floor()
+        .clamp(0.0, f64::from(layout.source_width.saturating_sub(1))) as u32;
+    let source_y = physical_y
+        .floor()
+        .clamp(0.0, f64::from(layout.source_height.saturating_sub(1))) as u32;
+    let local_x = (f64::from(source_x) / f64::from(layout.source_width) * f64::from(output.width))
         .floor()
         .clamp(0.0, f64::from(output.width.saturating_sub(1))) as u32;
-    let local_y = (physical_y / f64::from(layout.source_height) * f64::from(output.height))
+    let local_y = (f64::from(source_y) / f64::from(layout.source_height) * f64::from(output.height))
         .floor()
         .clamp(0.0, f64::from(output.height.saturating_sub(1))) as u32;
     Some(LogicalPoint {
+        source_x,
+        source_y,
         local_x,
         local_y,
         global_x: i64::from(output.x) + i64::from(local_x),
@@ -1052,20 +1090,20 @@ mod tests {
     fn control_must_be_available_and_explicitly_armed() {
         let mut view_only = ViewerState::new(Viewport::default(), false).unwrap();
         assert_eq!(view_only.handle_key(key(KeyCode::Char('i'))), Effect::None);
-        assert!(!view_only.armed);
+        assert!(!view_only.mouse_armed);
 
         let mut control = ViewerState::new(Viewport::default(), true).unwrap();
         assert_eq!(control.handle_key(key(KeyCode::Char('i'))), Effect::Chrome);
-        assert!(control.armed);
+        assert!(control.mouse_armed);
         assert_eq!(control.handle_key(key(KeyCode::Char('i'))), Effect::Chrome);
-        assert!(!control.armed);
+        assert!(!control.mouse_armed);
     }
 
     #[test]
     fn keyboard_input_mode_uses_a_prefix_to_recover_commands() {
         let mut state = ViewerState::new(Viewport::default(), true).unwrap();
         assert_eq!(state.handle_key(key(KeyCode::Char('t'))), Effect::Chrome);
-        assert!(state.keyboard_input);
+        assert_eq!(state.mode, InteractionMode::Input);
         assert_eq!(
             state.handle_key(key(KeyCode::Char('q'))),
             Effect::SendKey(EncodedKey {
@@ -1078,8 +1116,19 @@ mod tests {
         assert_eq!(state.handle_key(prefix), Effect::Chrome);
         assert!(state.prefix_pending);
         assert_eq!(state.handle_key(key(KeyCode::Char('t'))), Effect::Chrome);
-        assert!(!state.keyboard_input);
+        assert_eq!(state.mode, InteractionMode::Nav);
         assert!(!state.prefix_pending);
+    }
+
+    #[test]
+    fn input_prefix_can_toggle_independent_mouse_control() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        state.mode = InteractionMode::Input;
+        let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(prefix), Effect::Chrome);
+        assert_eq!(state.handle_key(key(KeyCode::Char('i'))), Effect::Chrome);
+        assert!(state.mouse_armed);
+        assert_eq!(state.mode, InteractionMode::Input);
     }
 
     #[test]
@@ -1121,7 +1170,7 @@ mod tests {
     #[test]
     fn doubled_command_prefix_is_sent_to_the_desktop() {
         let mut state = ViewerState::new(Viewport::default(), true).unwrap();
-        state.keyboard_input = true;
+        state.mode = InteractionMode::Input;
         let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
         assert_eq!(state.handle_key(prefix), Effect::Chrome);
         assert_eq!(
@@ -1136,7 +1185,7 @@ mod tests {
     #[test]
     fn non_ascii_characters_use_dynamic_unicode_keys() {
         let mut state = ViewerState::new(Viewport::default(), true).unwrap();
-        state.keyboard_input = true;
+        state.mode = InteractionMode::Input;
         assert_eq!(
             state.handle_key(key(KeyCode::Char('你'))),
             Effect::SendUnicode('你')
@@ -1156,11 +1205,11 @@ mod tests {
     #[test]
     fn echo_messages_expire_independently_from_mode_state() {
         let mut state = ViewerState::new(Viewport::default(), true).unwrap();
-        state.armed = true;
+        state.mouse_armed = true;
         state.message_for("Clicked 1:2", Duration::ZERO);
         state.expire_message();
         assert!(state.message.is_none());
-        assert!(state.armed);
+        assert!(state.mouse_armed);
         assert!(state.control);
     }
 
@@ -1202,12 +1251,51 @@ mod tests {
         assert_eq!(
             point,
             LogicalPoint {
+                source_x: 995,
+                source_y: 495,
                 local_x: 796,
                 local_y: 396,
                 global_x: -804,
                 global_y: 496,
             }
         );
+    }
+
+    #[test]
+    fn click_focus_zooms_one_step_and_moves_gradually_toward_target() {
+        let layout = DrawLayout {
+            cols: 100,
+            rows: 50,
+            sample_height: 100,
+            viewport: ViewportRect {
+                x: 0,
+                y: 0,
+                width: 2000,
+                height: 1000,
+            },
+            source_width: 2000,
+            source_height: 1000,
+        };
+        let target = LogicalPoint {
+            source_x: 1200,
+            source_y: 600,
+            local_x: 960,
+            local_y: 480,
+            global_x: 960,
+            global_y: 480,
+        };
+        let mut state = ViewerState::new(
+            Viewport {
+                zoom: 5.0,
+                ..Viewport::default()
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(state.zoom_toward(target, layout), Effect::Redraw);
+        assert_eq!(state.viewport.zoom, 6.25);
+        assert!((state.viewport.center_x - 0.5401).abs() < 0.0001);
+        assert!((state.viewport.center_y - 0.5402).abs() < 0.0001);
     }
 
     #[test]
