@@ -30,9 +30,10 @@ const PAN_VIEWPORT_FRACTION: f32 = 0.2;
 const MESSAGE_DURATION: Duration = Duration::from_secs(2);
 const ERROR_DURATION: Duration = Duration::from_secs(5);
 const SCROLL_BATCH_WINDOW: Duration = Duration::from_millis(12);
-const SCROLL_GESTURE_TIMEOUT: Duration = Duration::from_millis(180);
+const SCROLL_GESTURE_TIMEOUT: Duration = Duration::from_millis(80);
 const SCROLL_STEP_SCALE: f32 = 0.25;
 const MAX_SCROLL_STEPS_PER_FRAME: i32 = 4;
+const AXIS_SWITCH_THRESHOLD: i32 = 2;
 
 pub fn run(
     runtime_dir: &Path,
@@ -370,6 +371,7 @@ struct ScrollGesture {
     last_event_at: Option<Instant>,
     pending_x: i32,
     pending_y: i32,
+    cross_axis_evidence: i32,
 }
 
 impl ScrollGesture {
@@ -404,7 +406,38 @@ impl ScrollGesture {
         self.last_event_at = Some(now);
 
         let axis = match self.axis {
-            Some(axis) => axis,
+            Some(axis) => {
+                let (primary, cross) = match axis {
+                    ScrollAxis::Horizontal => (self.pending_x, self.pending_y),
+                    ScrollAxis::Vertical => (self.pending_y, self.pending_x),
+                };
+                let cross_is_dominant =
+                    cross != 0 && (primary == 0 || cross.abs() > primary.abs().saturating_mul(2));
+                if cross_is_dominant {
+                    if self.cross_axis_evidence.signum() != cross.signum() {
+                        self.cross_axis_evidence = 0;
+                    }
+                    self.cross_axis_evidence += cross;
+                } else if primary != 0 {
+                    self.cross_axis_evidence = 0;
+                }
+
+                if self.cross_axis_evidence.abs() >= AXIS_SWITCH_THRESHOLD {
+                    let new_axis = match axis {
+                        ScrollAxis::Horizontal => ScrollAxis::Vertical,
+                        ScrollAxis::Vertical => ScrollAxis::Horizontal,
+                    };
+                    self.axis = Some(new_axis);
+                    match new_axis {
+                        ScrollAxis::Horizontal => self.pending_x = self.cross_axis_evidence,
+                        ScrollAxis::Vertical => self.pending_y = self.cross_axis_evidence,
+                    }
+                    self.cross_axis_evidence = 0;
+                    new_axis
+                } else {
+                    axis
+                }
+            }
             None => {
                 let x = self.pending_x.abs();
                 let y = self.pending_y.abs();
@@ -416,6 +449,7 @@ impl ScrollGesture {
                     return None;
                 };
                 self.axis = Some(axis);
+                self.cross_axis_evidence = 0;
                 axis
             }
         };
@@ -932,35 +966,44 @@ mod tests {
         assert_eq!(state.viewport.center_y, 0.47);
         assert_eq!(state.viewport.center_x, 0.5);
 
-        // The initial vertical gesture remains axis-locked despite horizontal noise.
+        // One cross-axis event is treated as noise.
         assert_eq!(
             state.handle_scroll_batch(
-                &[mouse(MouseEventKind::ScrollRight, 40, 10); 4],
+                &[mouse(MouseEventKind::ScrollRight, 40, 10)],
                 layout,
-                started + Duration::from_millis(50),
+                started + Duration::from_millis(20),
             ),
             Effect::None
         );
         assert_eq!(state.viewport.center_x, 0.5);
 
-        // A pause starts a new gesture which can lock to the other axis.
-        let second_gesture =
-            started + Duration::from_millis(50) + SCROLL_GESTURE_TIMEOUT + Duration::from_millis(1);
+        // Sustained cross-axis input breaks the lock without waiting for a pause.
         assert_eq!(
             state.handle_scroll_batch(
-                &[mouse(MouseEventKind::ScrollRight, 40, 10); 4],
+                &[mouse(MouseEventKind::ScrollRight, 40, 10)],
                 layout,
-                second_gesture,
+                started + Duration::from_millis(30),
             ),
             Effect::Redraw
         );
-        assert_eq!(state.viewport.center_x, 0.54);
+        assert_eq!(state.viewport.center_x, 0.52);
+
+        // The new horizontal lock can likewise be interrupted vertically.
+        assert_eq!(
+            state.handle_scroll_batch(
+                &[mouse(MouseEventKind::ScrollUp, 40, 10); 2],
+                layout,
+                started + Duration::from_millis(40),
+            ),
+            Effect::Redraw
+        );
+        assert_eq!(state.viewport.center_y, 0.45);
         assert_eq!(state.viewport.zoom, 5.0);
         assert_eq!(
             state.handle_scroll_batch(
                 &[mouse(MouseEventKind::ScrollUp, 80, 10)],
                 layout,
-                second_gesture + SCROLL_GESTURE_TIMEOUT + Duration::from_millis(1),
+                started + SCROLL_GESTURE_TIMEOUT + Duration::from_millis(50),
             ),
             Effect::None
         );
