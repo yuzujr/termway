@@ -29,10 +29,17 @@ pub struct ViewportRect {
 
 pub struct RenderedFrame {
     pub bytes: Vec<u8>,
+    pub cells: Vec<Cell>,
     pub cols: u16,
     pub rows: u16,
     pub sample_height: u16,
     pub viewport: ViewportRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cell {
+    foreground: [u8; 3],
+    background: [u8; 3],
 }
 
 #[cfg(test)]
@@ -67,6 +74,7 @@ pub fn render_half_blocks_viewport(
         image::imageops::resize(&cropped, sample_width, sample_height, FilterType::Triangle);
     let rows = sample_height.div_ceil(2);
     let mut bytes = Vec::with_capacity(sample_width as usize * rows as usize * 36);
+    let mut cells = Vec::with_capacity(sample_width as usize * rows as usize);
 
     for y in (0..sample_height).step_by(2) {
         for x in 0..sample_width {
@@ -76,7 +84,12 @@ pub fn render_half_blocks_viewport(
             } else {
                 &Rgb([0, 0, 0])
             };
-            push_cell(&mut bytes, top, bottom);
+            let cell = Cell {
+                foreground: top.0,
+                background: bottom.0,
+            };
+            push_cell(&mut bytes, cell);
+            cells.push(cell);
         }
         bytes.extend_from_slice(b"\x1b[0m\x1b[K\r\n");
     }
@@ -84,6 +97,7 @@ pub fn render_half_blocks_viewport(
 
     Ok(RenderedFrame {
         bytes,
+        cells,
         cols: sample_width as u16,
         rows: rows as u16,
         sample_height: sample_height as u16,
@@ -136,15 +150,53 @@ fn fitted_sample_size(width: u32, height: u32, max_width: u32, max_height: u32) 
     }
 }
 
-fn push_cell(bytes: &mut Vec<u8>, foreground: &Rgb<u8>, background: &Rgb<u8>) {
+fn push_cell(bytes: &mut Vec<u8>, cell: Cell) {
     use std::io::Write as _;
 
     write!(
         bytes,
         "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
-        foreground[0], foreground[1], foreground[2], background[0], background[1], background[2],
+        cell.foreground[0],
+        cell.foreground[1],
+        cell.foreground[2],
+        cell.background[0],
+        cell.background[1],
+        cell.background[2],
     )
     .expect("writing to Vec cannot fail");
+}
+
+pub fn encode_cell_diff(previous: &[Cell], current: &[Cell], cols: u16) -> Vec<u8> {
+    assert_eq!(previous.len(), current.len());
+    assert!(cols > 0);
+    let cols = usize::from(cols);
+    let mut bytes = Vec::new();
+    let mut index = 0;
+    while index < current.len() {
+        if previous[index] == current[index] {
+            index += 1;
+            continue;
+        }
+
+        let row = index / cols;
+        let start = index;
+        let mut end = start + 1;
+        while end < current.len() && end / cols == row && previous[end] != current[end] {
+            end += 1;
+        }
+
+        use std::io::Write as _;
+        write!(bytes, "\x1b[{};{}H", row + 1, start % cols + 1)
+            .expect("writing to Vec cannot fail");
+        for &cell in &current[start..end] {
+            push_cell(&mut bytes, cell);
+        }
+        index = end;
+    }
+    if !bytes.is_empty() {
+        bytes.extend_from_slice(b"\x1b[0m");
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -171,6 +223,45 @@ mod tests {
             String::from_utf8(rendered.bytes).unwrap(),
             "\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m▀\x1b[0m\x1b[K\r\n\x1b[0m"
         );
+    }
+
+    #[test]
+    fn cell_diff_writes_only_changed_runs_at_absolute_positions() {
+        let black = Cell {
+            foreground: [0, 0, 0],
+            background: [0, 0, 0],
+        };
+        let red = Cell {
+            foreground: [255, 0, 0],
+            background: [0, 0, 0],
+        };
+        let previous = vec![black; 6];
+        let mut current = previous.clone();
+        current[1] = red;
+        current[2] = red;
+        current[5] = red;
+
+        let diff = String::from_utf8(encode_cell_diff(&previous, &current, 3)).unwrap();
+        assert_eq!(
+            diff,
+            concat!(
+                "\x1b[1;2H",
+                "\x1b[38;2;255;0;0m\x1b[48;2;0;0;0m▀",
+                "\x1b[38;2;255;0;0m\x1b[48;2;0;0;0m▀",
+                "\x1b[2;3H",
+                "\x1b[38;2;255;0;0m\x1b[48;2;0;0;0m▀",
+                "\x1b[0m",
+            )
+        );
+    }
+
+    #[test]
+    fn identical_cells_produce_no_terminal_output() {
+        let cell = Cell {
+            foreground: [1, 2, 3],
+            background: [4, 5, 6],
+        };
+        assert!(encode_cell_diff(&[cell; 4], &[cell; 4], 2).is_empty());
     }
 
     #[test]

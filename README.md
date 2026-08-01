@@ -60,8 +60,10 @@ termway 优先通过持久 Wayland 连接直接使用 `wlr-screencopy`，并在�
 会自动回退到 `grim`；`capture` 命令的 stderr 会显示实际 backend。
 
 viewer 在原生 backend 上额外运行最高 5 FPS 的 damage watcher。桌面静止时 compositor
-不会产生新帧；damage 发生在当前 viewport 之外，或可见像素实际没有变化时，也不会向
-SSH 终端发送重复 ANSI 帧。手动刷新仍使用立即完成的 capture，不会被
+不会产生新帧；damage 发生在当前 viewport 之外时也不会重绘。同一 viewport 下会比较
+新旧终端 cell，只发送变化的连续 cell 区间；完全相同的 cell buffer 不产生图像输出。
+后台 watcher 只保留最新帧，慢速渲染期间到达的旧帧会被覆盖。缩放、平移和终端 resize
+等布局变化仍完整重绘一次。手动刷新使用立即完成的 capture，不会被
 `copy_with_damage` 的等待语义阻塞。
 
 交互查看器默认从 1× 全景打开：

@@ -963,6 +963,7 @@ fn collect_scroll_batch(
 
 struct Terminal {
     stdout: Stdout,
+    last_image: Option<ImageCache>,
     last_mode_line: Option<(u16, String, bool)>,
     last_echo: Option<(u16, String)>,
 }
@@ -983,6 +984,7 @@ impl Terminal {
         }
         Ok(Self {
             stdout,
+            last_image: None,
             last_mode_line: None,
             last_echo: None,
         })
@@ -1007,15 +1009,36 @@ impl Terminal {
             source_height: frame.height(),
         };
         let mode_y = rows.saturating_sub(2);
-        self.stdout.sync_update(|stdout| -> io::Result<()> {
-            stdout.queue(MoveTo(0, 0))?;
-            stdout.write_all(&rendered.bytes)?;
-            for y in rendered.rows..mode_y {
-                stdout.queue(MoveTo(0, y))?;
-                stdout.queue(Clear(ClearType::CurrentLine))?;
+        let incremental = self
+            .last_image
+            .as_ref()
+            .filter(|previous| previous.layout == layout && previous.mode_y == mode_y)
+            .map(|previous| {
+                render::encode_cell_diff(&previous.cells, &rendered.cells, rendered.cols)
+            });
+        match incremental {
+            Some(bytes) if bytes.is_empty() => {}
+            Some(bytes) if bytes.len() < rendered.bytes.len() => {
+                self.stdout
+                    .sync_update(|stdout| stdout.write_all(&bytes))??;
             }
-            Ok(())
-        })??;
+            Some(_) | None => {
+                self.stdout.sync_update(|stdout| -> io::Result<()> {
+                    stdout.queue(MoveTo(0, 0))?;
+                    stdout.write_all(&rendered.bytes)?;
+                    for y in rendered.rows..mode_y {
+                        stdout.queue(MoveTo(0, y))?;
+                        stdout.queue(Clear(ClearType::CurrentLine))?;
+                    }
+                    Ok(())
+                })??;
+            }
+        }
+        self.last_image = Some(ImageCache {
+            layout,
+            mode_y,
+            cells: rendered.cells,
+        });
         self.draw_chrome(output_name, state, layout)?;
         Ok(layout)
     }
@@ -1133,6 +1156,12 @@ impl Terminal {
     }
 }
 
+struct ImageCache {
+    layout: DrawLayout,
+    mode_y: u16,
+    cells: Vec<render::Cell>,
+}
+
 const MOD_SHIFT: u32 = 1 << 0;
 const MOD_CONTROL: u32 = 1 << 2;
 const MOD_ALT: u32 = 1 << 3;
@@ -1244,7 +1273,7 @@ impl Drop for Terminal {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DrawLayout {
     cols: u16,
     rows: u16,
