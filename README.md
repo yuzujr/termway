@@ -1,0 +1,40 @@
+# termway
+
+在 SSH 终端中查看和操作远端 Wayland 桌面，首先支持 NixOS + niri。
+
+termway 的约束和一般远程桌面不同：
+
+- macOS 端只需要现有的 SSH 客户端和终端模拟器；
+- 不在 macOS 上安装原生 client、驱动或高权限组件；
+- 不开放额外网络端口，SSH 的 PTY 是唯一的远程传输层；
+- 可以作为普通全屏终端程序运行在 tmux window/pane 中；
+- 所有屏幕捕获和输入注入均发生在远端 Linux 主机。
+
+项目目前处于技术验证阶段。技术选型和架构见：
+
+- [技术选型](docs/technical-selection.md)
+- [架构设计](docs/architecture.md)
+- [验证计划](docs/spikes.md)
+- [ADR-0001：SSH-native 架构](docs/adr/0001-ssh-native.md)
+
+## 目标体验
+
+```console
+$ ssh home
+$ tmux new-window -n gui termway
+```
+
+启动后先显示 niri 窗口列表；选择窗口后显示远端画面，并把当前终端中的键盘和鼠标事件发送给该窗口。
+
+## 非目标
+
+第一阶段不实现音频、麦克风、文件传输、独立网络协议、macOS 原生客户端、完整视频播放或通用桌面环境支持。
+
+## 当前状态
+
+Spike 0 已实现，可以直接检查 niri session：
+
+```console
+nix develop --command cargo run -- doctor
+nix develop --command cargo run -- events --count 10
+```
