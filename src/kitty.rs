@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::process::Command;
 
@@ -128,6 +128,7 @@ pub struct Renderer {
     transport: Transport,
     image_id_base: u32,
     active_tiles: BTreeMap<u32, u32>,
+    known_tile_images: BTreeSet<u32>,
     active_atlas: Option<u32>,
     atlas_dimensions: Option<(u32, u32)>,
 }
@@ -151,6 +152,7 @@ impl Selection {
                 // by PID. All ids remain within the 24 bits carried by Unicode placeholders.
                 image_id_base: 0x50_0000 | ((std::process::id() & 0x7f) << 13),
                 active_tiles: BTreeMap::new(),
+                known_tile_images: BTreeSet::new(),
                 active_atlas: None,
                 atlas_dimensions: None,
             })),
@@ -276,6 +278,7 @@ impl Renderer {
             // navigation preview can safely discard later tiles without stranding m=1 uploads.
             output.push(transaction.into_iter().flatten().collect());
             self.active_tiles.insert(tile.index, image_id);
+            self.known_tile_images.insert(image_id);
         }
         if let Some(stale_tiles) = stale_tiles {
             for image_id in stale_tiles.into_values() {
@@ -293,14 +296,17 @@ impl Renderer {
 
     fn delete_active_images(&mut self, output: &mut Vec<Vec<u8>>) {
         self.delete_active_tiles(output);
-        if let Some(image_id) = self.active_atlas.take() {
-            push_delete_image(output, self.transport, image_id);
+        if self.active_atlas.take().is_some() {
+            for offset in ATLAS_IMAGE_OFFSETS {
+                push_delete_image(output, self.transport, self.image_id_base + offset);
+            }
         }
         self.atlas_dimensions = None;
     }
 
     fn delete_active_tiles(&mut self, output: &mut Vec<Vec<u8>>) {
-        for image_id in std::mem::take(&mut self.active_tiles).into_values() {
+        self.active_tiles.clear();
+        for image_id in std::mem::take(&mut self.known_tile_images) {
             push_delete_image(output, self.transport, image_id);
         }
     }
@@ -614,6 +620,7 @@ mod tests {
             transport: Transport::Direct,
             image_id_base: 7,
             active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
             active_atlas: None,
             atlas_dimensions: None,
         };
@@ -657,6 +664,7 @@ mod tests {
             transport: Transport::Direct,
             image_id_base: 7,
             active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
             active_atlas: None,
             atlas_dimensions: None,
         };
@@ -690,6 +698,7 @@ mod tests {
             transport: Transport::Tmux,
             image_id_base: 0x12_3456,
             active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
             active_atlas: None,
             atlas_dimensions: None,
         };
@@ -730,6 +739,7 @@ mod tests {
             transport: Transport::Direct,
             image_id_base: 7,
             active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
             active_atlas: None,
             atlas_dimensions: None,
         };
@@ -781,6 +791,7 @@ mod tests {
             transport: Transport::Direct,
             image_id_base: 7,
             active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
             active_atlas: None,
             atlas_dimensions: None,
         };
@@ -830,6 +841,7 @@ mod tests {
             transport: Transport::Tmux,
             image_id_base: 7,
             active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
             active_atlas: None,
             atlas_dimensions: None,
         };
@@ -854,5 +866,51 @@ mod tests {
             diacritic(0).unwrap(),
             diacritic(239).unwrap()
         )));
+    }
+
+    #[test]
+    fn atlas_transition_reclaims_both_generations_of_replaced_tiles() {
+        let mut renderer = Renderer {
+            transport: Transport::Direct,
+            image_id_base: 7,
+            active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
+            active_atlas: None,
+            atlas_dimensions: None,
+        };
+        for color in [image::Rgb([1, 2, 3]), image::Rgb([4, 5, 6])] {
+            renderer
+                .encode_tiles(
+                    &[RasterTile {
+                        image: RgbImage::from_pixel(1, 1, color),
+                        index: 0,
+                        col: 0,
+                        row: 0,
+                        cols: 1,
+                        rows: 1,
+                    }],
+                    false,
+                )
+                .unwrap();
+        }
+        let encoded = String::from_utf8(flatten(
+            renderer
+                .encode_atlas(
+                    &RgbImage::new(1, 1),
+                    ViewportRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    1,
+                    1,
+                )
+                .unwrap(),
+        ))
+        .unwrap();
+        assert!(encoded.contains("a=d,d=I,i=7,q=2"));
+        assert!(encoded.contains("a=d,d=I,i=8,q=2"));
+        assert!(renderer.known_tile_images.is_empty());
     }
 }
