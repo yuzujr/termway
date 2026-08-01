@@ -62,6 +62,8 @@ termway 优先通过持久 Wayland 连接直接使用 `wlr-screencopy`，并在�
 viewer 在原生 backend 上额外运行最高 5 FPS 的 damage watcher。桌面静止时 compositor
 不会产生新帧；damage 发生在当前 viewport 之外时也不会重绘。同一 viewport 下会比较
 新旧终端 cell，只发送变化的连续 cell 区间；完全相同的 cell buffer 不产生图像输出。
+ANSI 编码器会在连续 cell 间复用前景/背景色状态并把同时变化的颜色合成一条 SGR；同一
+120×38 实际桌面样例从 baseline 的 160,521 bytes 降到 97,833 bytes（约减少 39%）。
 后台 watcher 只保留最新帧，慢速渲染期间到达的旧帧会被覆盖。手动刷新使用立即完成的 capture，不会被
 `copy_with_damage` 的等待语义阻塞。
 
@@ -78,6 +80,11 @@ cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使�
 cell 都携带完整的 tile 行列坐标，内置完整 297 项 diacritic 表以支持宽 pane，不依赖 tmux
 局部重绘时无法保证的左邻 cell 推导。因此图片位置和 pane 坐标由 tmux 正常管理。
 modeline 会显示 `GFX:KITTY` 或 `GFX:ANSI`。
+
+tmux 下的 refined frame 以约 1.1 MB 为单帧传输预算。如果视频或大面积动画令无损 PNG
+超过预算，会按编码后的实际大小直接降到 900p/720p/540p/360p 中合适的一档，而不是先把
+超大帧塞进 tmux；modeline 显示当前档位。画面静止 2 秒后逐档恢复，避免动画期间反复抖动，
+同时让停止后的文字自动回到最高精度。navigation atlas 始终保留清晰的 1080p 全局预览。
 
 Kitty 协议输出使用非阻塞 PTY 和完整协议单元队列；每个约 4 KiB 的 APC 或一行 placeholder
 发送后都会重新处理终端输入。上一帧仍在发送时不会继续堆积 damage 帧，只记录一次最新画面

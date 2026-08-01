@@ -91,6 +91,7 @@ pub fn render_half_blocks_viewport(
     let mut cells = Vec::with_capacity(sample_width as usize * rows as usize);
 
     for y in (0..sample_height).step_by(2) {
+        let mut colors = TerminalColors::default();
         for x in 0..sample_width {
             let top = resized.get_pixel(x, y);
             let bottom = if y + 1 < sample_height {
@@ -102,7 +103,7 @@ pub fn render_half_blocks_viewport(
                 foreground: top.0,
                 background: bottom.0,
             };
-            push_cell(&mut bytes, cell);
+            push_cell(&mut bytes, cell, &mut colors);
             cells.push(cell);
         }
         bytes.extend_from_slice(b"\x1b[0m\x1b[K\r\n");
@@ -343,20 +344,45 @@ fn fitted_sample_size(width: u32, height: u32, max_width: u32, max_height: u32) 
     }
 }
 
-fn push_cell(bytes: &mut Vec<u8>, cell: Cell) {
+#[derive(Default)]
+struct TerminalColors {
+    foreground: Option<[u8; 3]>,
+    background: Option<[u8; 3]>,
+}
+
+fn push_cell(bytes: &mut Vec<u8>, cell: Cell, colors: &mut TerminalColors) {
     use std::io::Write as _;
 
-    write!(
-        bytes,
-        "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
-        cell.foreground[0],
-        cell.foreground[1],
-        cell.foreground[2],
-        cell.background[0],
-        cell.background[1],
-        cell.background[2],
-    )
+    match (
+        colors.foreground != Some(cell.foreground),
+        colors.background != Some(cell.background),
+    ) {
+        (true, true) => write!(
+            bytes,
+            "\x1b[38;2;{};{};{};48;2;{};{};{}m",
+            cell.foreground[0],
+            cell.foreground[1],
+            cell.foreground[2],
+            cell.background[0],
+            cell.background[1],
+            cell.background[2],
+        ),
+        (true, false) => write!(
+            bytes,
+            "\x1b[38;2;{};{};{}m",
+            cell.foreground[0], cell.foreground[1], cell.foreground[2],
+        ),
+        (false, true) => write!(
+            bytes,
+            "\x1b[48;2;{};{};{}m",
+            cell.background[0], cell.background[1], cell.background[2],
+        ),
+        (false, false) => Ok(()),
+    }
     .expect("writing to Vec cannot fail");
+    bytes.extend_from_slice("▀".as_bytes());
+    colors.foreground = Some(cell.foreground);
+    colors.background = Some(cell.background);
 }
 
 pub fn encode_cell_diff(previous: &[Cell], current: &[Cell], cols: u16) -> Vec<u8> {
@@ -364,6 +390,7 @@ pub fn encode_cell_diff(previous: &[Cell], current: &[Cell], cols: u16) -> Vec<u
     assert!(cols > 0);
     let cols = usize::from(cols);
     let mut bytes = Vec::new();
+    let mut colors = TerminalColors::default();
     let mut index = 0;
     while index < current.len() {
         if previous[index] == current[index] {
@@ -382,7 +409,7 @@ pub fn encode_cell_diff(previous: &[Cell], current: &[Cell], cols: u16) -> Vec<u
         write!(bytes, "\x1b[{};{}H", row + 1, start % cols + 1)
             .expect("writing to Vec cannot fail");
         for &cell in &current[start..end] {
-            push_cell(&mut bytes, cell);
+            push_cell(&mut bytes, cell, &mut colors);
         }
         index = end;
     }
@@ -414,7 +441,7 @@ mod tests {
         assert_eq!(rendered.rows, 1);
         assert_eq!(
             String::from_utf8(rendered.bytes).unwrap(),
-            "\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m▀\x1b[0m\x1b[K\r\n\x1b[0m"
+            "\x1b[38;2;1;2;3;48;2;4;5;6m▀\x1b[0m\x1b[K\r\n\x1b[0m"
         );
     }
 
@@ -439,12 +466,25 @@ mod tests {
             diff,
             concat!(
                 "\x1b[1;2H",
-                "\x1b[38;2;255;0;0m\x1b[48;2;0;0;0m▀",
-                "\x1b[38;2;255;0;0m\x1b[48;2;0;0;0m▀",
+                "\x1b[38;2;255;0;0;48;2;0;0;0m▀",
+                "▀",
                 "\x1b[2;3H",
-                "\x1b[38;2;255;0;0m\x1b[48;2;0;0;0m▀",
+                "▀",
                 "\x1b[0m",
             )
+        );
+    }
+
+    #[test]
+    fn flat_ansi_runs_reuse_terminal_colors() {
+        let image = RgbImage::from_pixel(80, 48, Rgb([12, 34, 56]));
+        let rendered = render_half_blocks(&image, 80, 24);
+        // A stateless encoder used about 140 KiB for this flat sample. Color state makes every
+        // cell after the first in a row just the three-byte half-block glyph.
+        assert!(
+            rendered.bytes.len() < 10_000,
+            "{} bytes",
+            rendered.bytes.len()
         );
     }
 
