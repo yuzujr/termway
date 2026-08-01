@@ -46,7 +46,11 @@ pub fn run(
     initial_viewport: Viewport,
 ) -> Result<()> {
     let mut state = ViewerState::new(initial_viewport, control)?;
-    let mut frame = capture::capture_with_grim(runtime_dir, wayland_display, Some(output_name))?;
+    let mut capturer = capture::Capturer::new(runtime_dir, wayland_display, output_name);
+    let mut frame = capturer.capture()?;
+    if let Some(reason) = capturer.fallback_reason() {
+        state.message(format!("Using grim fallback: {reason}"));
+    }
     validate_output_geometry(&frame, &output_geometry)?;
     let pointer = control
         .then(|| VirtualPointer::connect(runtime_dir, wayland_display, output_name))
@@ -69,11 +73,7 @@ pub fn run(
                 let auto_refresh = state.take_due_auto_refresh();
                 state.expire_message();
                 if auto_refresh {
-                    match capture::capture_with_grim(
-                        runtime_dir,
-                        wayland_display,
-                        Some(output_name),
-                    ) {
+                    match capturer.capture() {
                         Ok(new_frame) => {
                             frame = new_frame;
                             layout = terminal.draw(&frame, output_name, &state)?;
@@ -96,11 +96,7 @@ pub fn run(
                     Effect::Quit => break,
                     Effect::Refresh => {
                         state.cancel_auto_refresh();
-                        let refreshed = match capture::capture_with_grim(
-                            runtime_dir,
-                            wayland_display,
-                            Some(output_name),
-                        ) {
+                        let refreshed = match capturer.capture() {
                             Ok(new_frame) => {
                                 frame = new_frame;
                                 state.message("Refreshed frame");
@@ -172,11 +168,7 @@ pub fn run(
                                         point.global_y
                                     ));
                                     thread::sleep(Duration::from_millis(75));
-                                    if let Ok(new_frame) = capture::capture_with_grim(
-                                        runtime_dir,
-                                        wayland_display,
-                                        Some(output_name),
-                                    ) {
+                                    if let Ok(new_frame) = capturer.capture() {
                                         frame = new_frame;
                                         frame_changed = true;
                                     }

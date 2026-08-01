@@ -66,12 +66,16 @@ niri 官方建议复杂程序直接连接 `$NIRI_SOCKET`。JSON IPC 有兼容性
 
 第一轮用 `grim` 快速回答三个问题：SSH session 能否找到活动 Wayland display、截图延迟是多少、缩放并输出到终端后的可读性如何。
 
-验证成立后改为 `zwlr_screencopy_manager_v1`：
+验证成立后已改为 `zwlr_screencopy_manager_v1`，grim 保留为自动回退：
 
 - niri 已支持 wlr-screencopy v3；
 - 可以按 output 或 region 捕获；
 - 可利用 damage 信息减少无变化帧输出；
 - 无需每帧创建子进程。
+
+当前实现持有一个长期 Wayland connection，并复用 memfd-backed `wl_shm` buffer。首版绑定
+向后兼容的协议 v1，以保证 compositor 提供 SHM buffer 描述；升级到 v3
+`copy_with_damage` 和连续帧调度是下一阶段工作。
 
 窗口捕获初期采用“聚焦窗口后捕获其所在 output + viewport/zoom”。验证表明 niri 26.04 尚未提供 grim `-T` 所需的 `ext-image-copy-capture`，且 IPC 中窗口位置字段允许为空，因此不能可靠地直接捕获或按绝对坐标裁切窗口。当前实现使用与窗口坐标无关的 output viewport；未来 compositor 支持相应协议后再增加单窗口 backend。
 

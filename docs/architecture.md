@@ -41,7 +41,10 @@ src/
 
 ### View mode
 
-显示目标 output 或 viewport。当前版本缓存一次完整 output 捕获，zoom、pan 和 pane resize 只进行本地重绘，按 `r` 手动重新捕获。连续模式完成后默认低帧率，并只在 damage 或用户输入时优先刷新。
+显示目标 output 或 viewport。当前版本通过持久的 wlr-screencopy Wayland 连接捕获完整
+output，并跨帧复用 `wl_shm` buffer；协议不可用时回退到 grim。zoom、pan 和 pane resize
+只进行本地重绘，按 `r` 手动重新捕获，键盘输入停止后也会 debounce 自动刷新。连续模式
+完成后默认低帧率，并只在 damage 或用户输入时优先刷新。
 
 重绘采用以下策略：
 

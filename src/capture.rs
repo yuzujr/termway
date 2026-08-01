@@ -1,8 +1,70 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use image::RgbImage;
+
+use crate::screencopy::ScreencopySession;
+
+pub struct Capturer {
+    native: Option<ScreencopySession>,
+    runtime_dir: PathBuf,
+    wayland_display: String,
+    output_name: String,
+    fallback_reason: Option<String>,
+}
+
+impl Capturer {
+    pub fn new(runtime_dir: &Path, wayland_display: &str, output_name: &str) -> Self {
+        let (native, fallback_reason) =
+            match ScreencopySession::connect(runtime_dir, wayland_display, output_name) {
+                Ok(session) => (Some(session), None),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            };
+        Self {
+            native,
+            runtime_dir: runtime_dir.to_path_buf(),
+            wayland_display: wayland_display.to_owned(),
+            output_name: output_name.to_owned(),
+            fallback_reason,
+        }
+    }
+
+    pub fn capture(&mut self) -> Result<RgbImage> {
+        if let Some(native) = &mut self.native {
+            match native.capture() {
+                Ok(image) => return Ok(image),
+                Err(error) => {
+                    self.fallback_reason = Some(format!("{error:#}"));
+                    self.native = None;
+                }
+            }
+        }
+        capture_with_grim(
+            &self.runtime_dir,
+            &self.wayland_display,
+            Some(&self.output_name),
+        )
+        .with_context(|| {
+            self.fallback_reason.as_ref().map_or_else(
+                || "grim fallback failed".to_owned(),
+                |reason| format!("native screencopy failed ({reason}); grim fallback also failed"),
+            )
+        })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        if self.native.is_some() {
+            "wlr-screencopy"
+        } else {
+            "grim"
+        }
+    }
+
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.fallback_reason.as_deref()
+    }
+}
 
 pub fn capture_with_grim(
     runtime_dir: &Path,

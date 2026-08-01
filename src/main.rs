@@ -3,6 +3,7 @@ mod discovery;
 mod input;
 mod niri;
 mod render;
+mod screencopy;
 mod viewer;
 
 use std::io::{self, Write};
@@ -157,8 +158,8 @@ fn capture(
         .max(1);
 
     let started = std::time::Instant::now();
-    let frame =
-        capture::capture_with_grim(&discovered.runtime_dir, display, Some(output.as_str()))?;
+    let mut capturer = capture::Capturer::new(&discovered.runtime_dir, display, &output);
+    let frame = capturer.capture()?;
     let capture_elapsed = started.elapsed();
 
     let started = std::time::Instant::now();
@@ -177,7 +178,8 @@ fn capture(
     io::stdout().write_all(&rendered.bytes)?;
     io::stdout().flush()?;
     eprintln!(
-        "termway: output={output}, capture={}x{} in {:.1?}, viewport={}x{}+{},{} zoom={:.2}x, render={}x{} cells/{} bytes in {:.1?}",
+        "termway: output={output}, backend={}, capture={}x{} in {:.1?}, viewport={}x{}+{},{} zoom={:.2}x, render={}x{} cells/{} bytes in {:.1?}",
+        capturer.backend_name(),
         frame.width(),
         frame.height(),
         capture_elapsed,

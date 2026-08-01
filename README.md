@@ -39,7 +39,7 @@ nix develop --command cargo run -- doctor
 nix develop --command cargo run -- events --count 10
 ```
 
-Spike 1 已实现单帧捕获和 truecolor half-block 输出：
+单帧捕获和 truecolor half-block 输出已经可用：
 
 ```console
 # 自动使用当前终端尺寸和 niri 的 focused output
@@ -54,6 +54,10 @@ nix develop --command cargo run --release -- capture --zoom 3 --center-x 0.25 --
 ```
 
 图像 escape sequence 写入 stdout，捕获耗时、渲染耗时和字节数写入 stderr。图像路径请使用 release build；debug build 的缩放性能不具有代表性。
+
+termway 优先通过持久 Wayland 连接直接使用 `wlr-screencopy`，并在连续捕获之间复用
+`wl_shm` buffer，不再为每次刷新启动截图进程。compositor 不支持该协议或原生捕获失败时，
+会自动回退到 `grim`；`capture` 命令的 stderr 会显示实际 backend。
 
 交互查看器默认从 1× 全景打开：
 

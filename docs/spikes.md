@@ -75,13 +75,29 @@ macOS SSH 实测确认：half-block 在 5× 以上配合合适 viewport 可以�
 - 终端 cell 到 1.25-scale output 的映射正确；
 - 任意退出路径不会遗留按下状态。
 
-## Spike 4：原生连续捕获
+## Spike 4：原生连续捕获（进行中）
 
 目标：用 wlr-screencopy 替换 `grim`。
 
+已完成的基础路径：
+
+- 直接连接 SSH session 发现的 Wayland socket；
+- 选择 niri 的目标 `wl_output`；
+- 通过 `zwlr_screencopy_manager_v1` 捕获完整 output；
+- 使用 memfd-backed `wl_shm` buffer，并在尺寸和格式不变时跨帧复用；
+- 处理 stride、XRGB/ARGB/XBGR/ABGR 和 Y-invert；
+- 原生 backend 不可用或运行中失败时自动回退到 `grim`。
+
+当前 niri 26.04 实际暴露 wlr-screencopy v3，但没有暴露
+ext-image-copy-capture。termway 首版 client 绑定兼容的 screencopy v1，以获得有保证的
+`wl_shm` 格式协商；后续升级到 v3 的 `copy_with_damage`。
+
+2026-08-01 同一 eDP-1 上的 release 单帧命令实测为 17.7–18.7 ms（包含新建 Wayland
+连接），相比 warm grim 的约 30–32 ms 已有下降。viewer 会继续复用连接和 buffer。
+
 验收：
 
-- 复用 buffers；
+- 复用 buffers；（已完成）
 - 利用 damage 或等价机制避免无意义刷新；
 - 默认 5 FPS 下交互可用；
 - SSH 延迟和带宽受限时自动降帧，不堆积旧帧。
