@@ -190,6 +190,16 @@ pub fn align_raster_to_cell_grid(
     }
 }
 
+/// Reduce insignificant low channel bits before lossless PNG compression. At seven bits the
+/// maximum error is one sRGB code value, while desktop screenshots compress materially better.
+pub fn reduce_color_precision(image: &mut RgbImage, bits: u8) {
+    assert!((1..=8).contains(&bits));
+    let mask = u8::MAX << (8 - bits);
+    for channel in image.as_mut() {
+        *channel &= mask;
+    }
+}
+
 fn gcd(mut left: u32, mut right: u32) -> u32 {
     while right != 0 {
         (left, right) = (right, left % right);
@@ -607,6 +617,21 @@ mod tests {
         let aligned = align_raster_to_cell_grid(&image, 40, 12, 8, 16, 1920, 1080);
         assert_eq!(aligned.dimensions(), (320, 192));
         assert_eq!(aligned.width() * 12 * 16, aligned.height() * 40 * 8);
+    }
+
+    #[test]
+    fn reduced_color_precision_has_a_strict_one_level_error_at_seven_bits() {
+        let mut image = RgbImage::from_raw(2, 1, vec![0, 1, 2, 127, 128, 255]).unwrap();
+        let original = image.clone();
+        reduce_color_precision(&mut image, 7);
+        assert_eq!(image.as_raw(), &[0, 0, 2, 126, 128, 254]);
+        assert!(
+            original
+                .as_raw()
+                .iter()
+                .zip(image.as_raw())
+                .all(|(before, after)| before.abs_diff(*after) <= 1)
+        );
     }
 
     #[test]

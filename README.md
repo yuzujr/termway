@@ -79,7 +79,12 @@ cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使�
 120ms 后再用高分辨率 tile 覆盖预览。tmux 下使用 Unicode placeholders；每个 placeholder
 cell 都携带完整的 tile 行列坐标，内置完整 297 项 diacritic 表以支持宽 pane，不依赖 tmux
 局部重绘时无法保证的左邻 cell 推导。因此图片位置和 pane 坐标由 tmux 正常管理。
-modeline 会显示 `GFX:KITTY` 或 `GFX:ANSI`。
+modeline 会在 crop 阶段显示 `GFX:KITTY/PREVIEW`，refine 后显示实际档位（例如
+`GFX:KITTY/720p`）；ANSI 则显示 `GFX:ANSI`。
+
+Kitty raster 在 PNG 前丢弃每个 sRGB channel 的最低 1 bit，单通道最大误差仅 1/255，视觉上
+等同原图，同时抑制截图低位噪声。固定 1080p 桌面样例的完整 PNG 从 1,347,696 bytes 降到
+1,106,338 bytes（约减少 18%），编码也从 8.8ms 降到 6.6ms；tile diff 同样受益。
 
 tmux 下的 refined frame 以约 1.1 MB 为单帧传输预算。如果视频或大面积动画令无损 PNG
 超过预算，会按编码后的实际大小直接降到 900p/720p/540p/360p 中合适的一档，而不是先把

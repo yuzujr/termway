@@ -45,6 +45,7 @@ const DAMAGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const KITTY_MAX_WIDTH: u32 = 1920;
 const KITTY_MAX_HEIGHT: u32 = 1080;
 const KITTY_TILE_SIZE: u32 = 128;
+const KITTY_COLOR_BITS: u8 = 7;
 const KITTY_REFINE_DELAY: Duration = Duration::from_millis(120);
 const KITTY_QUALITY_HEIGHTS: &[u32] = &[1080, 900, 720, 540, 360];
 const KITTY_FRAME_BUDGET_BYTES: usize = 1_100_000;
@@ -1217,6 +1218,7 @@ struct Terminal {
     kitty_refine_at: Option<Instant>,
     kitty_quality: KittyQuality,
     kitty_quality_upgrade_at: Option<Instant>,
+    kitty_previewing: bool,
     force_kitty_redraw: bool,
     deferred_kitty_redraw: bool,
     last_mode_line: Option<(u16, String, bool)>,
@@ -1269,6 +1271,7 @@ impl Terminal {
             kitty_refine_at: None,
             kitty_quality: KittyQuality::default(),
             kitty_quality_upgrade_at: None,
+            kitty_previewing: false,
             force_kitty_redraw: false,
             deferred_kitty_redraw: false,
             last_mode_line: None,
@@ -1485,6 +1488,7 @@ impl Terminal {
                 KITTY_MAX_WIDTH,
                 KITTY_MAX_HEIGHT,
             );
+            render::reduce_color_precision(&mut atlas.image, KITTY_COLOR_BITS);
             let crop = render::map_viewport_to_raster(
                 layout.viewport,
                 frame.width(),
@@ -1525,6 +1529,7 @@ impl Terminal {
             self.kitty_atlas_ready = false;
             self.kitty_layout = Some(layout);
             self.kitty_refine_at = (!full_viewport).then(|| Instant::now() + KITTY_REFINE_DELAY);
+            self.kitty_previewing = !full_viewport;
             self.force_kitty_redraw = false;
             self.deferred_kitty_redraw = false;
             self.last_image = None;
@@ -1558,6 +1563,7 @@ impl Terminal {
                 self.last_kitty_image = None;
                 self.kitty_layout = Some(layout);
                 self.kitty_refine_at = Some(Instant::now() + KITTY_REFINE_DELAY);
+                self.kitty_previewing = true;
                 self.deferred_kitty_redraw = false;
             } else {
                 // An atlas placement is only valid once its complete upload reached Kitty.
@@ -1607,6 +1613,7 @@ impl Terminal {
                 quality_width,
                 quality_height,
             );
+            render::reduce_color_precision(&mut raster.image, KITTY_COLOR_BITS);
             let previous = self.last_kitty_image.as_ref().filter(|previous| {
                 previous.layout == layout
                     && previous.image.dimensions() == raster.image.dimensions()
@@ -1620,7 +1627,7 @@ impl Terminal {
                 &raster.image,
                 layout.cols,
                 layout.rows,
-                self.kitty_quality.tile_size(),
+                KITTY_TILE_SIZE,
             );
             let mut candidate = self
                 .kitty
@@ -1664,6 +1671,7 @@ impl Terminal {
         });
         self.kitty_layout = Some(layout);
         self.kitty_refine_at = None;
+        self.kitty_previewing = false;
         self.force_kitty_redraw = false;
         self.deferred_kitty_redraw = false;
         self.draw_chrome(output_name, state, layout)?;
@@ -1709,7 +1717,11 @@ impl Terminal {
             "IDLE:NORMAL"
         };
         let graphics = if self.kitty.is_some() {
-            format!("KITTY/{}", self.kitty_quality.label())
+            if self.kitty_previewing {
+                "KITTY/PREVIEW".to_owned()
+            } else {
+                format!("KITTY/{}", self.kitty_quality.label())
+            }
         } else {
             state.graphics_backend.to_owned()
         };
@@ -1991,15 +2003,6 @@ impl KittyQuality {
             540 => "540p",
             360 => "360p",
             _ => unreachable!("all Kitty quality tiers have labels"),
-        }
-    }
-
-    fn tile_size(&self) -> u32 {
-        match KITTY_QUALITY_HEIGHTS[self.tier] {
-            1080 | 900 => KITTY_TILE_SIZE,
-            720 => 192,
-            540 | 360 => 256,
-            _ => unreachable!("all Kitty quality tiers have tile sizes"),
         }
     }
 
@@ -2801,7 +2804,6 @@ mod tests {
         assert_eq!(quality.limits(), (1920, 1080));
         assert!(quality.reduce_for(6_000_000));
         assert_eq!(quality.label(), "360p");
-        assert_eq!(quality.tile_size(), 256);
         assert!(quality.upgrade());
         assert_eq!(quality.label(), "540p");
 
