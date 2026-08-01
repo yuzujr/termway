@@ -123,6 +123,7 @@ enum Transport {
     Tmux,
 }
 
+#[derive(Clone)]
 pub struct Renderer {
     transport: Transport,
     image_id_base: u32,

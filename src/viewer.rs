@@ -46,6 +46,9 @@ const KITTY_MAX_WIDTH: u32 = 1920;
 const KITTY_MAX_HEIGHT: u32 = 1080;
 const KITTY_TILE_SIZE: u32 = 128;
 const KITTY_REFINE_DELAY: Duration = Duration::from_millis(120);
+const KITTY_QUALITY_HEIGHTS: &[u32] = &[1080, 900, 720, 540, 360];
+const KITTY_FRAME_BUDGET_BYTES: usize = 1_100_000;
+const KITTY_QUALITY_RECOVERY_DELAY: Duration = Duration::from_secs(2);
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 // Keep tmux's eager pane reader from building a multi-megabyte client backlog. This is below a
 // 50 Mbit/s relay while remaining fast enough to deliver a typical UI frame in well under a
@@ -135,6 +138,7 @@ pub fn run(
                     frame = update.image;
                     if redraw {
                         state.cancel_auto_refresh();
+                        terminal.note_visible_damage();
                         layout = terminal.draw(&frame, output_name, &state)?;
                     }
                 }
@@ -1211,6 +1215,8 @@ struct Terminal {
     kitty_atlas_ready: bool,
     kitty_layout: Option<DrawLayout>,
     kitty_refine_at: Option<Instant>,
+    kitty_quality: KittyQuality,
+    kitty_quality_upgrade_at: Option<Instant>,
     force_kitty_redraw: bool,
     deferred_kitty_redraw: bool,
     last_mode_line: Option<(u16, String, bool)>,
@@ -1261,6 +1267,8 @@ impl Terminal {
             kitty_atlas_ready: false,
             kitty_layout: None,
             kitty_refine_at: None,
+            kitty_quality: KittyQuality::default(),
+            kitty_quality_upgrade_at: None,
             force_kitty_redraw: false,
             deferred_kitty_redraw: false,
             last_mode_line: None,
@@ -1318,19 +1326,36 @@ impl Terminal {
     }
 
     fn next_wakeup_timeout(&self) -> Option<Duration> {
-        self.kitty_refine_at
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        let now = Instant::now();
+        earliest_timeout(
+            self.kitty_refine_at
+                .map(|deadline| deadline.saturating_duration_since(now)),
+            self.kitty_quality_upgrade_at
+                .map(|deadline| deadline.saturating_duration_since(now)),
+        )
     }
 
     fn take_due_refine(&mut self) -> bool {
-        if self
-            .kitty_refine_at
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        let now = Instant::now();
+        let refine_due = self.kitty_refine_at.is_some_and(|deadline| now >= deadline);
+        if refine_due {
             self.kitty_refine_at = None;
-            true
-        } else {
-            false
+        }
+        let upgrade_due = self
+            .kitty_quality_upgrade_at
+            .is_some_and(|deadline| now >= deadline);
+        if upgrade_due {
+            self.kitty_quality_upgrade_at = None;
+            if self.kitty_quality.upgrade() && !self.kitty_quality.is_maximum() {
+                self.kitty_quality_upgrade_at = Some(now + KITTY_QUALITY_RECOVERY_DELAY);
+            }
+        }
+        refine_due || upgrade_due
+    }
+
+    fn note_visible_damage(&mut self) {
+        if !self.kitty_quality.is_maximum() {
+            self.kitty_quality_upgrade_at = Some(Instant::now() + KITTY_QUALITY_RECOVERY_DELAY);
         }
     }
 
@@ -1559,42 +1584,64 @@ impl Terminal {
             return Ok(layout);
         }
 
-        let mut raster = render::render_raster_viewport(
-            frame,
-            display_pixel_width.min(KITTY_MAX_WIDTH),
-            display_pixel_height.min(KITTY_MAX_HEIGHT),
-            state.viewport,
-        )?;
-        debug_assert_eq!(raster.viewport, layout.viewport);
-        raster.image = render::align_raster_to_cell_grid(
-            &raster.image,
-            layout.cols,
-            layout.rows,
-            cell_width,
-            cell_height,
-            KITTY_MAX_WIDTH,
-            KITTY_MAX_HEIGHT,
-        );
-        let previous = self.last_kitty_image.as_ref().filter(|previous| {
-            previous.layout == layout && previous.image.dimensions() == raster.image.dimensions()
-        });
         let previous_layout = self
             .last_kitty_image
             .as_ref()
             .map(|previous| previous.layout);
-        let reset = self.force_kitty_redraw || previous.is_none();
-        let tiles = render::changed_raster_tiles(
-            (!reset)
-                .then_some(previous)
-                .flatten()
-                .map(|previous| &previous.image),
-            &raster.image,
-            layout.cols,
-            layout.rows,
-            KITTY_TILE_SIZE,
-        );
-        let renderer = self.kitty.as_mut().expect("Kitty renderer was selected");
-        let mut segments = renderer.encode_tiles(&tiles, reset)?;
+        let mut quality_reduced = false;
+        let (raster, mut segments) = loop {
+            let (quality_width, quality_height) = self.kitty_quality.limits();
+            let mut raster = render::render_raster_viewport(
+                frame,
+                display_pixel_width.min(quality_width),
+                display_pixel_height.min(quality_height),
+                state.viewport,
+            )?;
+            debug_assert_eq!(raster.viewport, layout.viewport);
+            raster.image = render::align_raster_to_cell_grid(
+                &raster.image,
+                layout.cols,
+                layout.rows,
+                cell_width,
+                cell_height,
+                quality_width,
+                quality_height,
+            );
+            let previous = self.last_kitty_image.as_ref().filter(|previous| {
+                previous.layout == layout
+                    && previous.image.dimensions() == raster.image.dimensions()
+            });
+            let reset = self.force_kitty_redraw || previous.is_none();
+            let tiles = render::changed_raster_tiles(
+                (!reset)
+                    .then_some(previous)
+                    .flatten()
+                    .map(|previous| &previous.image),
+                &raster.image,
+                layout.cols,
+                layout.rows,
+                self.kitty_quality.tile_size(),
+            );
+            let mut candidate = self
+                .kitty
+                .as_ref()
+                .expect("Kitty renderer was selected")
+                .clone();
+            let segments = candidate.encode_tiles(&tiles, reset)?;
+            let encoded_bytes = segments.iter().map(Vec::len).sum();
+            if candidate.is_tmux()
+                && encoded_bytes > KITTY_FRAME_BUDGET_BYTES
+                && self.kitty_quality.reduce_for(encoded_bytes)
+            {
+                quality_reduced = true;
+                continue;
+            }
+            *self.kitty.as_mut().expect("Kitty renderer was selected") = candidate;
+            break (raster, segments);
+        };
+        if quality_reduced {
+            self.kitty_quality_upgrade_at = Some(Instant::now() + KITTY_QUALITY_RECOVERY_DELAY);
+        }
         if let Some(previous_layout) = previous_layout
             && previous_layout != layout
         {
@@ -1661,6 +1708,11 @@ impl Terminal {
         } else {
             "IDLE:NORMAL"
         };
+        let graphics = if self.kitty.is_some() {
+            format!("KITTY/{}", self.kitty_quality.label())
+        } else {
+            state.graphics_backend.to_owned()
+        };
         let input_hint = if state.mode == InteractionMode::Input {
             "C-\\ prefix"
         } else if !state.control {
@@ -1672,8 +1724,7 @@ impl Terminal {
         };
         let mode_line = fit_status(
             &format!(
-                " - Termway: {output_name}  [{mode} | {mouse} | {scroll} | {idle} | GFX:{}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  a idle  r refresh  q quit ",
-                state.graphics_backend,
+                " - Termway: {output_name}  [{mode} | {mouse} | {scroll} | {idle} | GFX:{graphics}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  a idle  r refresh  q quit ",
                 state.viewport.zoom,
                 state.viewport.center_x * 100.0,
                 state.viewport.center_y * 100.0,
@@ -1919,6 +1970,65 @@ struct KittyAtlasCache {
     max_rows: u16,
     cell_width: u32,
     cell_height: u32,
+}
+
+#[derive(Debug, Default)]
+struct KittyQuality {
+    tier: usize,
+}
+
+impl KittyQuality {
+    fn limits(&self) -> (u32, u32) {
+        let height = KITTY_QUALITY_HEIGHTS[self.tier];
+        (KITTY_MAX_WIDTH * height / KITTY_MAX_HEIGHT, height)
+    }
+
+    fn label(&self) -> &'static str {
+        match KITTY_QUALITY_HEIGHTS[self.tier] {
+            1080 => "1080p",
+            900 => "900p",
+            720 => "720p",
+            540 => "540p",
+            360 => "360p",
+            _ => unreachable!("all Kitty quality tiers have labels"),
+        }
+    }
+
+    fn tile_size(&self) -> u32 {
+        match KITTY_QUALITY_HEIGHTS[self.tier] {
+            1080 | 900 => KITTY_TILE_SIZE,
+            720 => 192,
+            540 | 360 => 256,
+            _ => unreachable!("all Kitty quality tiers have tile sizes"),
+        }
+    }
+
+    fn is_maximum(&self) -> bool {
+        self.tier == 0
+    }
+
+    fn reduce_for(&mut self, encoded_bytes: usize) -> bool {
+        let initial = self.tier;
+        while self.tier + 1 < KITTY_QUALITY_HEIGHTS.len() {
+            let current = KITTY_QUALITY_HEIGHTS[initial] as u64;
+            let candidate = KITTY_QUALITY_HEIGHTS[self.tier + 1] as u64;
+            let projected = encoded_bytes as u64 * candidate * candidate / (current * current);
+            self.tier += 1;
+            if projected <= KITTY_FRAME_BUDGET_BYTES as u64 {
+                break;
+            }
+        }
+        self.tier != initial
+    }
+
+    fn upgrade(&mut self) -> bool {
+        if self.tier == 0 {
+            false
+        } else {
+            self.tier -= 1;
+            true
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2683,5 +2793,20 @@ mod tests {
             limiter.allowance(1_000, started + Duration::from_millis(225)),
             100
         );
+    }
+
+    #[test]
+    fn kitty_quality_jumps_to_a_frame_budget_and_recovers_gradually() {
+        let mut quality = KittyQuality::default();
+        assert_eq!(quality.limits(), (1920, 1080));
+        assert!(quality.reduce_for(6_000_000));
+        assert_eq!(quality.label(), "360p");
+        assert_eq!(quality.tile_size(), 256);
+        assert!(quality.upgrade());
+        assert_eq!(quality.label(), "540p");
+
+        let mut moderate = KittyQuality::default();
+        assert!(moderate.reduce_for(1_500_000));
+        assert_eq!(moderate.label(), "900p");
     }
 }
