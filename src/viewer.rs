@@ -2,6 +2,7 @@ use std::io::{self, Stdout, Write};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{collections::VecDeque, mem};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -28,6 +29,10 @@ const ZOOM_STEP: f32 = 1.25;
 const PAN_VIEWPORT_FRACTION: f32 = 0.2;
 const MESSAGE_DURATION: Duration = Duration::from_secs(2);
 const ERROR_DURATION: Duration = Duration::from_secs(5);
+const SCROLL_BATCH_WINDOW: Duration = Duration::from_millis(12);
+const SCROLL_GESTURE_TIMEOUT: Duration = Duration::from_millis(180);
+const SCROLL_STEP_SCALE: f32 = 0.25;
+const MAX_SCROLL_STEPS_PER_FRAME: i32 = 4;
 
 pub fn run(
     runtime_dir: &Path,
@@ -45,17 +50,23 @@ pub fn run(
         .transpose()?;
     let mut terminal = Terminal::enter()?;
     let mut layout = terminal.draw(&frame, output_name, &state)?;
+    let mut pending_events = VecDeque::new();
 
     loop {
-        if let Some(timeout) = state.message_timeout()
-            && (timeout.is_zero()
-                || !event::poll(timeout).context("cannot poll terminal events")?)
-        {
-            state.expire_message();
-            terminal.draw_echo(&state)?;
-            continue;
-        }
-        match event::read().context("cannot read a terminal event")? {
+        let terminal_event = if let Some(pending) = pending_events.pop_front() {
+            pending
+        } else {
+            if let Some(timeout) = state.message_timeout()
+                && (timeout.is_zero()
+                    || !event::poll(timeout).context("cannot poll terminal events")?)
+            {
+                state.expire_message();
+                terminal.draw_echo(&state)?;
+                continue;
+            }
+            event::read().context("cannot read a terminal event")?
+        };
+        match terminal_event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 match state.handle_key(key) {
                     Effect::Quit => break,
@@ -87,8 +98,12 @@ pub fn run(
                 }
             }
             Event::Mouse(mouse) => {
-                if state.handle_mouse_navigation(mouse, layout) == Effect::Redraw {
-                    layout = terminal.draw(&frame, output_name, &state)?;
+                if is_scroll(mouse.kind) {
+                    let scrolls = collect_scroll_batch(mouse, &mut pending_events)?;
+                    if state.handle_scroll_batch(&scrolls, layout, Instant::now()) == Effect::Redraw
+                    {
+                        layout = terminal.draw(&frame, output_name, &state)?;
+                    }
                     continue;
                 }
                 if let Some(point) = map_left_click(mouse, layout, &output_geometry) {
@@ -158,6 +173,7 @@ struct ViewerState {
     message: Option<EchoMessage>,
     control: bool,
     armed: bool,
+    scroll_gesture: ScrollGesture,
 }
 
 #[derive(Debug)]
@@ -183,6 +199,7 @@ impl ViewerState {
             message: None,
             control,
             armed: false,
+            scroll_gesture: ScrollGesture::default(),
         };
         state.clamp_center();
         Ok(state)
@@ -312,22 +329,135 @@ impl ViewerState {
         self.viewport.center_y = self.viewport.center_y.clamp(margin, 1.0 - margin);
     }
 
-    fn handle_mouse_navigation(&mut self, mouse: MouseEvent, layout: DrawLayout) -> Effect {
-        if mouse.column >= layout.cols || mouse.row >= layout.rows {
+    fn handle_scroll_batch(
+        &mut self,
+        events: &[MouseEvent],
+        layout: DrawLayout,
+        now: Instant,
+    ) -> Effect {
+        let movement = self.scroll_gesture.consume(
+            events
+                .iter()
+                .copied()
+                .filter(|mouse| mouse.column < layout.cols && mouse.row < layout.rows),
+            now,
+        );
+        let Some((axis, steps)) = movement else {
             return Effect::None;
-        }
-        let effect = match mouse.kind {
-            MouseEventKind::ScrollUp => self.pan(0.0, -1.0),
-            MouseEventKind::ScrollDown => self.pan(0.0, 1.0),
-            MouseEventKind::ScrollLeft => self.pan(-1.0, 0.0),
-            MouseEventKind::ScrollRight => self.pan(1.0, 0.0),
-            _ => Effect::None,
+        };
+        let steps = steps.clamp(-MAX_SCROLL_STEPS_PER_FRAME, MAX_SCROLL_STEPS_PER_FRAME) as f32
+            * SCROLL_STEP_SCALE;
+        let effect = match axis {
+            ScrollAxis::Horizontal => self.pan(steps, 0.0),
+            ScrollAxis::Vertical => self.pan(0.0, steps),
         };
         if effect == Effect::Redraw {
             self.message = None;
         }
         effect
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Default)]
+struct ScrollGesture {
+    axis: Option<ScrollAxis>,
+    last_event_at: Option<Instant>,
+    pending_x: i32,
+    pending_y: i32,
+}
+
+impl ScrollGesture {
+    fn consume(
+        &mut self,
+        events: impl IntoIterator<Item = MouseEvent>,
+        now: Instant,
+    ) -> Option<(ScrollAxis, i32)> {
+        if self
+            .last_event_at
+            .is_some_and(|last| now.saturating_duration_since(last) > SCROLL_GESTURE_TIMEOUT)
+        {
+            *self = Self::default();
+        }
+
+        let mut saw_scroll = false;
+        for mouse in events {
+            let (x, y) = match mouse.kind {
+                MouseEventKind::ScrollUp => (0, -1),
+                MouseEventKind::ScrollDown => (0, 1),
+                MouseEventKind::ScrollLeft => (-1, 0),
+                MouseEventKind::ScrollRight => (1, 0),
+                _ => continue,
+            };
+            saw_scroll = true;
+            self.pending_x += x;
+            self.pending_y += y;
+        }
+        if !saw_scroll {
+            return None;
+        }
+        self.last_event_at = Some(now);
+
+        let axis = match self.axis {
+            Some(axis) => axis,
+            None => {
+                let x = self.pending_x.abs();
+                let y = self.pending_y.abs();
+                let axis = if x > y {
+                    ScrollAxis::Horizontal
+                } else if y > x {
+                    ScrollAxis::Vertical
+                } else {
+                    return None;
+                };
+                self.axis = Some(axis);
+                axis
+            }
+        };
+        let steps = match axis {
+            ScrollAxis::Horizontal => mem::take(&mut self.pending_x),
+            ScrollAxis::Vertical => mem::take(&mut self.pending_y),
+        };
+        self.pending_x = 0;
+        self.pending_y = 0;
+        (steps != 0).then_some((axis, steps))
+    }
+}
+
+fn is_scroll(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    )
+}
+
+fn collect_scroll_batch(
+    first: MouseEvent,
+    pending_events: &mut VecDeque<Event>,
+) -> Result<Vec<MouseEvent>> {
+    let deadline = Instant::now() + SCROLL_BATCH_WINDOW;
+    let mut scrolls = vec![first];
+    while scrolls.len() < 256 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || !event::poll(remaining).context("cannot poll batched scroll events")?
+        {
+            break;
+        }
+        match event::read().context("cannot read a batched terminal event")? {
+            Event::Mouse(mouse) if is_scroll(mouse.kind) => scrolls.push(mouse),
+            other => pending_events.push_back(other),
+        }
+    }
+    Ok(scrolls)
 }
 
 struct Terminal {
@@ -785,25 +915,63 @@ mod tests {
             false,
         )
         .unwrap();
+        let started = Instant::now();
         assert_eq!(
-            state.handle_mouse_navigation(mouse(MouseEventKind::ScrollUp, 40, 10), layout),
+            state.handle_scroll_batch(
+                &[
+                    mouse(MouseEventKind::ScrollLeft, 40, 10),
+                    mouse(MouseEventKind::ScrollUp, 40, 10),
+                    mouse(MouseEventKind::ScrollUp, 40, 10),
+                    mouse(MouseEventKind::ScrollUp, 40, 10),
+                ],
+                layout,
+                started,
+            ),
             Effect::Redraw
         );
-        assert_eq!(state.viewport.center_y, 0.46);
+        assert_eq!(state.viewport.center_y, 0.47);
+        assert_eq!(state.viewport.center_x, 0.5);
+
+        // The initial vertical gesture remains axis-locked despite horizontal noise.
         assert_eq!(
-            state.handle_mouse_navigation(mouse(MouseEventKind::ScrollRight, 40, 10), layout),
+            state.handle_scroll_batch(
+                &[mouse(MouseEventKind::ScrollRight, 40, 10); 4],
+                layout,
+                started + Duration::from_millis(50),
+            ),
+            Effect::None
+        );
+        assert_eq!(state.viewport.center_x, 0.5);
+
+        // A pause starts a new gesture which can lock to the other axis.
+        let second_gesture =
+            started + Duration::from_millis(50) + SCROLL_GESTURE_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(
+            state.handle_scroll_batch(
+                &[mouse(MouseEventKind::ScrollRight, 40, 10); 4],
+                layout,
+                second_gesture,
+            ),
             Effect::Redraw
         );
-        assert!(state.viewport.center_x > 0.5);
+        assert_eq!(state.viewport.center_x, 0.54);
         assert_eq!(state.viewport.zoom, 5.0);
         assert_eq!(
-            state.handle_mouse_navigation(mouse(MouseEventKind::ScrollUp, 80, 10), layout),
+            state.handle_scroll_batch(
+                &[mouse(MouseEventKind::ScrollUp, 80, 10)],
+                layout,
+                second_gesture + SCROLL_GESTURE_TIMEOUT + Duration::from_millis(1),
+            ),
             Effect::None
         );
 
         let mut overview = ViewerState::new(Viewport::default(), false).unwrap();
         assert_eq!(
-            overview.handle_mouse_navigation(mouse(MouseEventKind::ScrollDown, 40, 10), layout),
+            overview.handle_scroll_batch(
+                &[mouse(MouseEventKind::ScrollDown, 40, 10)],
+                layout,
+                started,
+            ),
             Effect::None
         );
     }
