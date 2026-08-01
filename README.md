@@ -24,7 +24,9 @@ $ ssh home
 $ tmux new-window -n gui termway
 ```
 
-启动后先显示 niri 窗口列表；选择窗口后显示远端画面，并把当前终端中的键盘和鼠标事件发送给该窗口。
+启动后显示 niri 当前 output；用 click-to-focus/zoom 定位目标，按需 arm 鼠标或进入 INPUT
+模式，把当前终端中的键盘、鼠标和滚动事件发送给桌面。常用程序和 compositor action 由
+配置式 action palette 提供入口。
 
 ## 非目标
 

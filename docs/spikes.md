@@ -51,7 +51,7 @@
 
 macOS SSH 实测确认：half-block 在 5× 以上配合合适 viewport 可以读清 CC Switch 文字。因此该 renderer 定位为不支持 Kitty Graphics 时的兼容回退：1× 用于全景定位，5×–9× 用于阅读和操作。连续刷新和 damage tracking 属于 Spike 4。
 
-## Spike 2：终端输入
+## Spike 2：终端输入（已完成）
 
 目标：只解析并可视化终端事件，不注入桌面。
 
@@ -62,11 +62,13 @@ macOS SSH 实测确认：half-block 在 5× 以上配合合适 viewport 可以�
 - tmux 内外行为一致；
 - SSH 中断后恢复终端模式和光标。
 
-进展：viewer 已覆盖普通字符、方向键、组合退出键和 resize，并通过真实 tmux send-keys 测试。bracketed paste、SGR mouse 和完整输入可视化仍待实现。
+viewer 已覆盖 ASCII/Unicode、方向和功能键、修饰键、resize、SGR 左右键和双轴滚动，并
+通过真实 tmux `send-keys` 测试。INPUT 模式用 `Ctrl-\` 前缀保留 TUI 控制入口。
 
-## Spike 3：家中侧输入注入
+## Spike 3：家中侧输入注入（已完成）
 
-目标：使用 ydotool 验证 niri 下的键盘、点击与坐标映射。
+实现改为直接使用 Wayland virtual pointer v2 和 virtual keyboard v1，不再需要 ydotool、
+uinput 权限或后台 service。已实测可操作 CC Switch、直接输入中文、左右键点击与双轴滚动。
 
 验收：
 
@@ -75,7 +77,7 @@ macOS SSH 实测确认：half-block 在 5× 以上配合合适 viewport 可以�
 - 终端 cell 到 1.25-scale output 的映射正确；
 - 任意退出路径不会遗留按下状态。
 
-## Spike 4：原生连续捕获（已实现，待真实 SSH 验收）
+## Spike 4：原生连续捕获（已完成）
 
 目标：用 wlr-screencopy 替换 `grim`。
 
@@ -103,10 +105,10 @@ ext-image-copy-capture。termway 首版 client 绑定兼容的 screencopy v1，�
 
 - 复用 buffers；（已完成）
 - 利用 damage 或等价机制避免无意义刷新；（已实现）
-- 默认 5 FPS 下交互可用；（已实现，待真实 SSH 验收）
-- SSH 延迟和带宽受限时自动降帧，不堆积旧帧。（latest-frame 已实现）
+- 默认 5 FPS 下交互可用；（已通过 SSH/tmux 实测）
+- SSH 延迟和带宽受限时不堆积旧帧。（latest-frame + 非阻塞输出已实现）
 
-## Spike 5：Kitty Graphics
+## Spike 5：Kitty Graphics（已完成）
 
 目标：在支持时自动提供高分辨率模式。
 
@@ -117,12 +119,18 @@ ext-image-copy-capture。termway 首版 client 绑定兼容的 screencopy v1，�
 - 不支持或响应超时时无缝降级至 half-block；
 - resize、切 pane、detach/attach 后不残留图片。
 
+当前实现包含 1080p terminal-side navigation atlas、source-crop 即时 zoom/pan、延迟 tile
+refine、tmux Unicode placeholders、稳定双缓冲 tile、带宽 pacing 和 1080p–360p 自适应
+画质。固定 7-bit/channel 预处理最大误差为 1/255，可显著减少 PNG。无法使用 Kitty 时
+`auto` 自动回退到带 cell diff 的 ANSI half-block。
+
 ## MVP 完成定义
 
 在 macOS 的现有终端中 SSH 到家里 NixOS，进入 tmux 后运行 termway，可以：
 
-1. 从 niri 窗口列表中选择 CC Switch；
+1. 通过全景和 click-to-focus 找到 CC Switch；
 2. 看清 profile 列表；
 3. 使用键盘或终端鼠标切换 profile；
-4. 安全退出并回到 shell；
-5. macOS 端除 SSH/终端外不安装任何组件。
+4. 通过配置式 action palette 打开应用或调用 compositor action；
+5. 安全退出并回到 shell；
+6. macOS 端除 SSH/终端外不安装任何组件。

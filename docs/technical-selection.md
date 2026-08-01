@@ -15,9 +15,8 @@
 | 捕获验证 | `grim` 子进程输出 PPM/PNG | 一开始就实现全部 Wayland 协议 |
 | 正式捕获 | `wayland-client` + `wayland-protocols-wlr` screencopy | PipeWire/portal 作为 niri 首选路径 |
 | 图像缩放 | MVP 使用 `image`，性能验证后考虑 `fast_image_resize` | 自研 SIMD 作为早期工作 |
-| 输入验证 | `ydotool`/`ydotoold` | 依赖 niri 提供不存在的点击 IPC |
-| 正式输入 | 独立的最小权限 Unix-socket broker + `evdev` uinput | 让 SSH shell 直接获得整个 `input` 组权限 |
-| 异步模型 | 主线程终端事件循环；捕获与 broker I/O 分离任务 | 所有 Wayland、TTY、编码工作塞进单线程 |
+| 正式输入 | Wayland virtual pointer v2 + virtual keyboard v1 | `ydotool`、uinput broker、直接读取 input device |
+| 异步模型 | 主线程终端/输出循环 + 单槽后台 damage watcher | 无界帧队列或全量 async runtime |
 | 构建与开发 | Cargo + Nix flake | 仅依赖开发机全局工具链 |
 
 ## 为什么选择 Rust
@@ -90,14 +89,12 @@ niri 官方建议复杂程序直接连接 `$NIRI_SOCKET`。JSON IPC 有兼容性
 - SGR extended mouse mode；
 - focus events（可用时）。
 
-程序把字符、功能键、paste 和鼠标 cell 坐标转换成内部事件。Linux 侧输入注入分两步：
-
-1. spike 使用 `ydotoold`，验证 niri 下键盘、绝对/相对鼠标和点击；
-2. 正式实现使用小型 broker 创建 uinput virtual keyboard/pointer。
-
-broker 只监听 `$XDG_RUNTIME_DIR/termway/input.sock`，校验 Unix peer credential，仅接受当前用户，限制可创建的设备能力，并提供立即断开/释放所有按键的 failsafe。主 TUI 不直接获得读取真实 `/dev/input/*` 的权限。
-
-portal/libei 后端可以未来加入；它更符合 Wayland 安全模型，但无人值守会话中的授权弹窗和 compositor 支持必须先验证，不能作为 MVP 唯一路径。
+程序把字符、功能键和鼠标 cell 坐标转换成内部事件。当前 niri 直接暴露
+`zwlr_virtual_pointer_manager_v1` 和 `zwp_virtual_keyboard_manager_v1`，因此正式路径使用普通
+用户的 Wayland connection 注入绝对定位、左右键、双轴滚轮和键盘事件，不需要 `ydotool`、
+uinput service、`input` group 或高权限 broker。非 ASCII 输入通过按需生成的小型 XKB keymap
+直接发送 Unicode code point。compositor-global shortcut 不接收 virtual keyboard 事件，
+这类入口由配置驱动的 action palette 调用普通命令。
 
 ## 初始 Rust 依赖候选
 
@@ -110,8 +107,7 @@ portal/libei 后端可以未来加入；它更符合 Wayland 安全模型，但�
 - `image`
 - `wayland-client`
 - `wayland-protocols-wlr`
-- `evdev`
-- `tokio` 或 `calloop`，在原生 screencopy spike 后二选一
+- `zbus`（idle inhibitor）
 
 不把大型视频编码器、FFmpeg、PipeWire 或 GUI toolkit 放进第一阶段依赖树。
 
@@ -121,5 +117,5 @@ portal/libei 后端可以未来加入；它更符合 Wayland 安全模型，但�
 2. fractional scaling、output transform 和终端 cell 到桌面坐标的映射。
 3. tmux 对 Kitty Graphics 和终端能力查询响应的转发。
 4. macOS 终端按键序列无法无损表达所有 Linux keycode，特别是修饰键按下/释放状态。
-5. uinput 的授权边界与 stuck key 恢复。
+5. virtual keyboard 无法触发 compositor-global shortcut，需要 action palette 替代入口。
 6. 全屏高频 ANSI 更新的带宽和 tmux CPU 消耗。

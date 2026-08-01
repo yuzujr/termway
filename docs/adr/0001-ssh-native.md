@@ -13,7 +13,8 @@
 
 termway 本体运行在远端 NixOS 主机。它只使用当前 PTY 的 stdin/stdout 与用户交互，不定义跨网络应用协议，也不需要 macOS 二进制。
 
-需要特权的输入注入隔离到远端本机的最小 broker；画面捕获和 niri 状态均来自远端 graphical session。
+画面捕获、输入注入和 niri 状态均来自远端 graphical session。niri 提供的 Wayland virtual
+pointer/keyboard protocols 足以完成输入，因此实现不需要特权 broker。
 
 ## 后果
 

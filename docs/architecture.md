@@ -11,33 +11,31 @@ macOS terminal
               ├─ stdout: ANSI/Kitty Graphics
               ├─ $NIRI_SOCKET: state/action
               ├─ Wayland socket: screencopy
-              └─ input.sock
-                  └─ termway-input-broker    家中 NixOS 服务
-                      └─ /dev/uinput
+              ├─ Wayland virtual pointer/keyboard
+              └─ session D-Bus: idle inhibit
 ```
 
-远程边界只有 SSH。`termway` 和 input broker 之间使用本机 Unix socket，不监听 TCP。
+远程边界只有 SSH。termway 不监听 TCP，也不需要额外 service 或特权进程。
 
 ## 模块边界
 
 ```text
 src/
-  app/          状态机、模式切换、退出与错误恢复
-  terminal/     TTY 生命周期、能力探测、输入解析
-  niri/         JSON IPC、event stream、窗口选择
-  capture/      grim spike 与正式 wlr-screencopy backend
-  render/       half-block、Kitty Graphics、viewport
-  input/        坐标映射、key translation、broker protocol
-  broker/       uinput 设备生命周期和安全策略
+  viewer.rs      状态机、TTY 生命周期、输出调度、坐标映射
+  kitty.rs       Kitty transport、tile、atlas、tmux placeholders
+  render.rs      half-block、cell diff、raster/viewport/tile
+  screencopy.rs  wlr-screencopy session 与 buffer 复用
+  capture.rs     damage watcher、原生捕获与 grim fallback
+  input.rs       Wayland virtual pointer/keyboard
+  niri.rs        JSON IPC 与 output geometry
+  config.rs      action palette 配置和进程环境
+  idle.rs        ScreenSaver D-Bus inhibitor
 ```
 
-模块之间传递带单位的坐标类型：`PhysicalPx`、`LogicalPx`、`TerminalCell`，避免裸 `(i32, i32)`。
+捕获 viewport、terminal cell 和 niri output logical coordinates 通过显式结构传递，点击映射
+先回到 capture source pixel，再映射到 output logical coordinate。
 
 ## 运行模式
-
-### Window picker
-
-默认入口。通过 niri event stream 展示窗口标题、app id、workspace 和 output。选择后调用 niri action 聚焦窗口。
 
 ### View mode
 
@@ -49,25 +47,27 @@ output，并跨帧复用 `wl_shm` buffer；协议不可用时回退到 grim。zo
 latest-frame 槽，因此 SSH 输出慢时不会积压帧。手动 capture 仍走独立的立即返回路径，
 不会在静止画面上等待 damage。
 
-重绘采用以下策略：
+ANSI 重绘采用以下策略：
 
 - 不在帧开始时清空屏幕，而是以新图直接覆盖旧图；
 - 每行完成后清理右侧残留，整张图完成后再清理下方残留；
 - 使用 DEC synchronized update（CSI 2026）请求终端原子提交一帧；
 - 边界按键和其他无状态变化的事件不触发绘制；
-- 整帧在内存中生成后才写入 stdout。
+- 连续 cell 复用 ANSI 颜色状态，damage 帧只发送变化 run。
 
-不支持 synchronized update 的终端会忽略该序列，但仍能从“旧图直接被新图覆盖”获得比预清屏更好的退化体验。后续如果整帧带宽成为瓶颈，再引入 cell buffer diff，只发送发生变化的连续区段。
+Kitty 模式缓存 1080p navigation atlas，zoom/pan 只发送 source-crop placement；120ms idle
+后用 128px cell-aligned tile refine。tmux 路径使用完整 Unicode placeholder 坐标、限制
+输出 burst，并按配置带宽和实际 PNG 大小选择 1080p–360p；静止后逐档恢复。
 
 ### Control mode
 
-显式按键进入后才转发普通输入，明显显示控制状态。固定 escape chord 必须永远由 termway 自己处理。退出、SSH 断开或 panic 时 broker 必须释放全部按键和按钮。
+显式按键进入后才转发普通输入，明显显示控制状态。固定 escape chord 永远由 termway 自己
+处理。每次 Wayland 按键/按钮操作在一个调用中完成 press/release，断开不会遗留按下状态。
 
 ## tmux 语义
 
 - termway 是普通前台程序，不修改 tmux server；
-- pane detach 后暂停输出或降至零 FPS，attach/resize 后请求关键帧；
-- 监听 `SIGWINCH`，重建 viewport；
+- resize 后重建 atlas 和 viewport；
 - half-block renderer 不需要 tmux passthrough；
 - Kitty renderer 只有探测成功后才启用；
 - 不接管 tmux prefix，控制模式的 escape chord 默认避开 `C-b`。
@@ -76,9 +76,7 @@ latest-frame 槽，因此 SSH 输出慢时不会积压帧。手动 capture 仍�
 
 - 不监听公网或局域网端口；
 - SSH 负责认证和加密；
-- broker socket 位于用户 runtime directory，权限 `0600`；
-- broker 使用 `SO_PEERCRED` 验证调用者 UID；
 - 不读取任何真实 input device；
-- 默认只创建项目需要的有限 virtual device capabilities；
 - 日志禁止记录文本输入、paste 内容和原始按键流；
-- 支持 `--view-only`，完全不连接 input broker。
+- 默认只读；只有显式 `--control` 才连接 virtual input protocols，点击仍需在 TUI 内按 `i`
+  二次 arm。
