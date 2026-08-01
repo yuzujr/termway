@@ -148,9 +148,9 @@ impl Selection {
             Ok(transport) => Ok(Self::Kitty(Renderer {
                 transport,
                 // Unicode placeholders carry 24 bits of image id in their foreground color.
-                // Reserve thirteen low bits for two image ids per tile and vary the next seven
-                // by PID. All ids remain within the 24 bits carried by Unicode placeholders.
-                image_id_base: 0x50_0000 | ((std::process::id() & 0x7f) << 13),
+                // Reserve thirteen low bits for tile/atlas ids and use the remaining namespace
+                // bits for the process. All ids fit in the 24-bit placeholder foreground color.
+                image_id_base: image_id_base(std::process::id()),
                 active_tiles: BTreeMap::new(),
                 known_tile_images: BTreeSet::new(),
                 active_atlas: None,
@@ -162,6 +162,11 @@ impl Selection {
             Err(error) => Err(error),
         }
     }
+}
+
+fn image_id_base(pid: u32) -> u32 {
+    // Namespace zero would make the first tile use the reserved invalid image id zero.
+    ((pid % 2047) + 1) << 13
 }
 
 impl Renderer {
@@ -604,6 +609,16 @@ mod tests {
     }
 
     #[test]
+    fn process_image_namespace_fits_all_reserved_ids_in_24_bits() {
+        for pid in [0, 1, 2046, 2047, u32::MAX] {
+            let base = image_id_base(pid);
+            assert!(base > 0);
+            assert!(base + ATLAS_IMAGE_OFFSETS[1] <= 0x00ff_ffff);
+        }
+        assert_ne!(image_id_base(100), image_id_base(101));
+    }
+
+    #[test]
     fn wraps_apc_for_tmux_and_escapes_inner_escape_bytes() {
         let mut direct = Vec::new();
         push_apc(&mut direct, Transport::Direct, "a=d", &[]);
@@ -833,6 +848,7 @@ mod tests {
         assert!(!preview.contains("a=t"));
         assert!(!preview.contains("iVBOR"));
         assert!(preview.contains("x=100,y=60,w=200,h=120"));
+        assert!(preview.len() < 256, "{} preview bytes", preview.len());
     }
 
     #[test]
