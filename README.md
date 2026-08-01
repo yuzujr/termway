@@ -70,7 +70,7 @@ nix develop --command cargo run --release -- view
 - `c`：保持倍率并回到中心；
 - `r`：重新捕获当前画面；
 - 鼠标左键：预览该 terminal cell 对应的 output 逻辑坐标；
-- 鼠标/触控板上下滚动：缩放 viewport；
+- 鼠标滚轮或触控板上下滚动：垂直平移 viewport；
 - 触控板左右滚动：水平平移 viewport（取决于终端是否发送水平滚动事件）；
 - `q`、Esc、Ctrl-C、Ctrl-D：退出。
 

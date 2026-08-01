@@ -317,12 +317,8 @@ impl ViewerState {
             return Effect::None;
         }
         let effect = match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                self.set_zoom((self.viewport.zoom * ZOOM_STEP).min(MAX_ZOOM))
-            }
-            MouseEventKind::ScrollDown => {
-                self.set_zoom((self.viewport.zoom / ZOOM_STEP).max(MIN_ZOOM))
-            }
+            MouseEventKind::ScrollUp => self.pan(0.0, -1.0),
+            MouseEventKind::ScrollDown => self.pan(0.0, 1.0),
             MouseEventKind::ScrollLeft => self.pan(-1.0, 0.0),
             MouseEventKind::ScrollRight => self.pan(1.0, 0.0),
             _ => Effect::None,
@@ -761,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_zooms_and_horizontal_scroll_pans_inside_image() {
+    fn mouse_and_trackpad_scroll_pan_inside_image() {
         let layout = DrawLayout {
             cols: 80,
             rows: 20,
@@ -781,19 +777,33 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        let mut state = ViewerState::new(Viewport::default(), false).unwrap();
+        let mut state = ViewerState::new(
+            Viewport {
+                zoom: 5.0,
+                ..Viewport::default()
+            },
+            false,
+        )
+        .unwrap();
         assert_eq!(
             state.handle_mouse_navigation(mouse(MouseEventKind::ScrollUp, 40, 10), layout),
             Effect::Redraw
         );
-        assert_eq!(state.viewport.zoom, 1.25);
+        assert_eq!(state.viewport.center_y, 0.46);
         assert_eq!(
             state.handle_mouse_navigation(mouse(MouseEventKind::ScrollRight, 40, 10), layout),
             Effect::Redraw
         );
         assert!(state.viewport.center_x > 0.5);
+        assert_eq!(state.viewport.zoom, 5.0);
         assert_eq!(
             state.handle_mouse_navigation(mouse(MouseEventKind::ScrollUp, 80, 10), layout),
+            Effect::None
+        );
+
+        let mut overview = ViewerState::new(Viewport::default(), false).unwrap();
+        assert_eq!(
+            overview.handle_mouse_navigation(mouse(MouseEventKind::ScrollDown, 40, 10), layout),
             Effect::None
         );
     }
