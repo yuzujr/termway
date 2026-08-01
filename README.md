@@ -38,3 +38,15 @@ Spike 0 已实现，可以直接检查 niri session：
 nix develop --command cargo run -- doctor
 nix develop --command cargo run -- events --count 10
 ```
+
+Spike 1 已实现单帧捕获和 truecolor half-block 输出：
+
+```console
+# 自动使用当前终端尺寸和 niri 的 focused output
+nix develop --command cargo run --release -- capture
+
+# 固定输出尺寸，便于测试或重定向
+nix develop --command cargo run --release -- capture --cols 120 --rows 36
+```
+
+图像 escape sequence 写入 stdout，捕获耗时、渲染耗时和字节数写入 stderr。图像路径请使用 release build；debug build 的缩放性能不具有代表性。

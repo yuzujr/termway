@@ -15,7 +15,7 @@
 
 实现会依次检查命令行覆盖、当前进程环境、systemd user environment 和 runtime directory。扫描得到多个活动 niri session 时拒绝猜测，要求显式传入 `--niri-socket`。
 
-## Spike 1：只看画面
+## Spike 1：只看画面（单帧链路已实现）
 
 目标：`grim` 截图经缩放后，以 truecolor half-block 输出到当前 PTY。
 
@@ -26,6 +26,25 @@
 - 正确处理 1.25 scale 和终端 resize；
 - CC Switch 的 profile 名在局部 zoom 下可读；
 - 记录单帧耗时、字节数和 CPU。
+
+当前实现：
+
+- 自动从 niri focused output 选择目标，也支持 `--output` 覆盖；
+- 为 `grim` 补齐 SSH session 中缺失的 `WAYLAND_DISPLAY`；
+- 直接解析 stdout 中的 P6 PPM，不创建持久截图文件；
+- 使用 triangle filter 等比缩放；
+- 每个 `▀` 字符以前景色承载上像素、背景色承载下像素；
+- 自动读取终端尺寸，也支持 `--cols`/`--rows`；
+- 图像与 metrics 分别写入 stdout/stderr。
+
+2026-08-01 在当前 eDP-1（2560×1600、scale 1.25）上的 release 实测：
+
+- grim 捕获约 30–32 ms；
+- 115×36 cells 渲染约 9 ms；
+- 单帧 ANSI 约 170 KB；
+- 80×24 tmux pane 中实际图像宽 73 cells，没有横向换行。
+
+剩余工作：用 CC Switch 实际验证局部文字可读性。连续刷新和 damage tracking 属于 Spike 4。
 
 ## Spike 2：终端输入
 

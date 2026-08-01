@@ -87,6 +87,20 @@ impl Client {
             focused_window,
         })
     }
+
+    pub fn focused_output_name(&mut self) -> Result<Option<String>> {
+        let reply = self.request("FocusedOutput")?;
+        let output = variant(&reply, "FocusedOutput")?;
+        if output.is_null() {
+            return Ok(None);
+        }
+        output
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .map(Some)
+            .context("niri FocusedOutput response has no string name")
+    }
 }
 
 pub fn probe_event_stream(path: &Path, timeout: Duration) -> Result<Value> {
