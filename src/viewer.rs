@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::{self, Stdout, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -18,6 +19,8 @@ use crossterm::{ExecutableCommand, QueueableCommand, SynchronizedUpdate};
 use image::RgbImage;
 
 use crate::capture;
+use crate::config::{Action, ActionRunner};
+use crate::idle::IdleInhibitor;
 use crate::input::{VirtualKeyboard, VirtualPointer};
 use crate::niri::OutputGeometry;
 use crate::render::{self, Viewport, ViewportRect};
@@ -37,6 +40,12 @@ const AUTO_REFRESH_DELAY: Duration = Duration::from_millis(250);
 const CLICK_FOCUS_FRACTION: f32 = 0.4;
 const DAMAGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 
+pub struct ActionOptions<'a> {
+    pub actions: Vec<Action>,
+    pub niri_socket: &'a Path,
+    pub environment: &'a [(OsString, OsString)],
+}
+
 pub fn run(
     runtime_dir: &Path,
     wayland_display: &str,
@@ -44,8 +53,30 @@ pub fn run(
     output_geometry: OutputGeometry,
     control: bool,
     initial_viewport: Viewport,
+    action_options: ActionOptions<'_>,
 ) -> Result<()> {
     let mut state = ViewerState::new(initial_viewport, control)?;
+    state.actions = action_options.actions;
+    let mut idle_inhibitor = if control {
+        match IdleInhibitor::acquire() {
+            Ok(inhibitor) => {
+                state.idle_inhibited = true;
+                Some(inhibitor)
+            }
+            Err(error) => {
+                state.error(format!("Idle inhibit unavailable: {error:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let action_runner = ActionRunner::new(
+        runtime_dir,
+        wayland_display,
+        action_options.niri_socket,
+        action_options.environment,
+    );
     let mut capturer = capture::Capturer::new(runtime_dir, wayland_display, output_name);
     let mut frame = capturer.capture()?;
     if let Some(reason) = capturer.fallback_reason() {
@@ -154,6 +185,32 @@ pub fn run(
                             terminal.draw_echo(&state)?;
                         }
                     }
+                    Effect::RunAction(index) => {
+                        let action = state.actions[index].clone();
+                        match action_runner.spawn(&action) {
+                            Ok(()) => state.message(format!("Started action: {}", action.name)),
+                            Err(error) => state.error(format!("Action failed: {error:#}")),
+                        }
+                        terminal.draw_echo(&state)?;
+                    }
+                    Effect::ToggleIdleInhibit => {
+                        if idle_inhibitor.take().is_some() {
+                            state.idle_inhibited = false;
+                            state.message("Idle inhibition disabled");
+                        } else {
+                            match IdleInhibitor::acquire() {
+                                Ok(inhibitor) => {
+                                    idle_inhibitor = Some(inhibitor);
+                                    state.idle_inhibited = true;
+                                    state.message("Idle inhibition enabled");
+                                }
+                                Err(error) => {
+                                    state.error(format!("Idle inhibit failed: {error:#}"));
+                                }
+                            }
+                        }
+                        terminal.draw_chrome(output_name, &state, layout)?;
+                    }
                     Effect::Redraw => layout = terminal.draw(&frame, output_name, &state)?,
                     Effect::Chrome => terminal.draw_chrome(output_name, &state, layout)?,
                     Effect::SendKey(encoded) => {
@@ -186,7 +243,34 @@ pub fn run(
             Event::Mouse(mouse) => {
                 if is_scroll(mouse.kind) {
                     let scrolls = collect_scroll_batch(mouse, &mut pending_events)?;
-                    if state.handle_scroll_batch(&scrolls, layout, Instant::now()) == Effect::Redraw
+                    if state.scroll_target == ScrollTarget::Desktop {
+                        let movement = state.scroll_movement(&scrolls, layout, Instant::now());
+                        let anchor = scrolls
+                            .iter()
+                            .rev()
+                            .find(|event| event.column < layout.cols && event.row < layout.rows)
+                            .and_then(|event| {
+                                map_pointer_position(*event, layout, &output_geometry)
+                            });
+                        if let (Some((axis, steps)), Some(point), Some(pointer)) =
+                            (movement, anchor, &pointer)
+                        {
+                            let steps = steps
+                                .clamp(-MAX_SCROLL_STEPS_PER_FRAME, MAX_SCROLL_STEPS_PER_FRAME);
+                            if let Err(error) = pointer.scroll(
+                                point.local_x,
+                                point.local_y,
+                                output_geometry.width,
+                                output_geometry.height,
+                                axis == ScrollAxis::Horizontal,
+                                steps,
+                            ) {
+                                state.error(format!("Scroll injection failed: {error:#}"));
+                                terminal.draw_echo(&state)?;
+                            }
+                        }
+                    } else if state.handle_scroll_batch(&scrolls, layout, Instant::now())
+                        == Effect::Redraw
                     {
                         layout = terminal.draw(&frame, output_name, &state)?;
                     }
@@ -250,9 +334,13 @@ struct ViewerState {
     viewport: Viewport,
     message: Option<EchoMessage>,
     control: bool,
+    idle_inhibited: bool,
     mouse_armed: bool,
+    scroll_target: ScrollTarget,
     mode: InteractionMode,
     prefix_pending: bool,
+    palette: Option<PaletteState>,
+    actions: Vec<Action>,
     auto_refresh_at: Option<Instant>,
     scroll_gesture: ScrollGesture,
 }
@@ -263,10 +351,22 @@ enum InteractionMode {
     Input,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollTarget {
+    View,
+    Desktop,
+}
+
 #[derive(Debug)]
 struct EchoMessage {
     text: String,
     expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct PaletteState {
+    query: String,
+    selected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +376,8 @@ enum Effect {
     Chrome,
     SendKey(EncodedKey),
     SendUnicode(char),
+    RunAction(usize),
+    ToggleIdleInhibit,
     Refresh,
     Quit,
 }
@@ -287,9 +389,13 @@ impl ViewerState {
             viewport,
             message: None,
             control,
+            idle_inhibited: false,
             mouse_armed: false,
+            scroll_target: ScrollTarget::View,
             mode: InteractionMode::Nav,
             prefix_pending: false,
+            palette: None,
+            actions: Vec::new(),
             auto_refresh_at: None,
             scroll_gesture: ScrollGesture::default(),
         };
@@ -298,6 +404,9 @@ impl ViewerState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Effect {
+        if self.palette.is_some() {
+            return self.handle_palette_key(key);
+        }
         if self.mode == InteractionMode::Input {
             return self.handle_input_key(key);
         }
@@ -325,18 +434,10 @@ impl ViewerState {
                 });
                 Effect::Chrome
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.set_zoom((self.viewport.zoom * ZOOM_STEP).min(MAX_ZOOM))
-            }
-            KeyCode::Char('-') => self.set_zoom((self.viewport.zoom / ZOOM_STEP).max(MIN_ZOOM)),
-            KeyCode::Char(digit @ '1'..='9') => self.set_zoom(digit.to_digit(10).unwrap() as f32),
-            KeyCode::Char('0') => self.reset_overview(),
-            KeyCode::Char('c') => self.center(),
-            KeyCode::Left | KeyCode::Char('h') => self.pan(-1.0, 0.0),
-            KeyCode::Right | KeyCode::Char('l') => self.pan(1.0, 0.0),
-            KeyCode::Up | KeyCode::Char('k') => self.pan(0.0, -1.0),
-            KeyCode::Down | KeyCode::Char('j') => self.pan(0.0, 1.0),
-            _ => Effect::None,
+            KeyCode::Char('s') if self.control => self.toggle_scroll_target(),
+            KeyCode::Char('a') if self.control => Effect::ToggleIdleInhibit,
+            KeyCode::Char('x') => self.open_palette(),
+            _ => self.handle_view_command(key).unwrap_or(Effect::None),
         };
         if effect == Effect::Redraw {
             self.message = None;
@@ -353,7 +454,7 @@ impl ViewerState {
                     modifiers: MOD_CONTROL,
                 });
             }
-            return match key.code {
+            let command = match key.code {
                 KeyCode::Char('t') => {
                     self.mode = InteractionMode::Nav;
                     self.message("Keyboard input disabled");
@@ -370,11 +471,22 @@ impl ViewerState {
                     });
                     Effect::Chrome
                 }
-                _ => {
-                    self.error(format!("Undefined prefix key: C-\\ {:?}", key.code));
-                    Effect::Chrome
-                }
+                KeyCode::Char('s') => self.toggle_scroll_target(),
+                KeyCode::Char('a') => Effect::ToggleIdleInhibit,
+                KeyCode::Char('x') => self.open_palette(),
+                _ => Effect::None,
             };
+            if !matches!(
+                key.code,
+                KeyCode::Char('t' | 'q' | 'r' | 'i' | 's' | 'a' | 'x')
+            ) {
+                if let Some(effect) = self.handle_view_command(key) {
+                    return effect;
+                }
+                self.error(format!("Undefined prefix key: C-\\ {:?}", key.code));
+                return Effect::Chrome;
+            }
+            return command;
         }
         if is_command_prefix(key) {
             self.prefix_pending = true;
@@ -395,8 +507,156 @@ impl ViewerState {
         }
     }
 
+    fn handle_view_command(&mut self, key: KeyEvent) -> Option<Effect> {
+        let effect = match key.code {
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.set_zoom((self.viewport.zoom * ZOOM_STEP).min(MAX_ZOOM))
+            }
+            KeyCode::Char('-') => self.set_zoom((self.viewport.zoom / ZOOM_STEP).max(MIN_ZOOM)),
+            KeyCode::Char(digit @ '1'..='9') => self.set_zoom(digit.to_digit(10).unwrap() as f32),
+            KeyCode::Char('0') => self.reset_overview(),
+            KeyCode::Char('c') => self.center(),
+            KeyCode::Left | KeyCode::Char('h') => self.pan(-1.0, 0.0),
+            KeyCode::Right | KeyCode::Char('l') => self.pan(1.0, 0.0),
+            KeyCode::Up | KeyCode::Char('k') => self.pan(0.0, -1.0),
+            KeyCode::Down | KeyCode::Char('j') => self.pan(0.0, 1.0),
+            _ => return None,
+        };
+        if effect == Effect::Redraw {
+            self.message = None;
+        }
+        Some(effect)
+    }
+
+    fn open_palette(&mut self) -> Effect {
+        if self.actions.is_empty() {
+            self.error("No actions configured; see examples/config.toml");
+            return Effect::Chrome;
+        }
+        self.message = None;
+        self.palette = Some(PaletteState::default());
+        Effect::Chrome
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Effect {
+        if key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g'))
+        {
+            self.palette = None;
+            self.message("Quit");
+            return Effect::Chrome;
+        }
+
+        let matches = self.palette_matches();
+        match key.code {
+            KeyCode::Enter => {
+                let Some(index) = matches
+                    .get(self.palette.as_ref().unwrap().selected)
+                    .copied()
+                else {
+                    return Effect::Chrome;
+                };
+                self.palette = None;
+                Effect::RunAction(index)
+            }
+            KeyCode::Backspace => {
+                let palette = self.palette.as_mut().unwrap();
+                palette.query.pop();
+                palette.selected = 0;
+                Effect::Chrome
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                if !matches.is_empty() {
+                    let palette = self.palette.as_mut().unwrap();
+                    palette.selected = if palette.selected == 0 {
+                        matches.len() - 1
+                    } else {
+                        palette.selected - 1
+                    };
+                }
+                Effect::Chrome
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if !matches.is_empty() {
+                    let palette = self.palette.as_mut().unwrap();
+                    palette.selected = (palette.selected + 1) % matches.len();
+                }
+                Effect::Chrome
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                let palette = self.palette.as_mut().unwrap();
+                palette.query.push(character);
+                palette.selected = 0;
+                Effect::Chrome
+            }
+            _ => Effect::None,
+        }
+    }
+
+    fn palette_matches(&self) -> Vec<usize> {
+        let query = self
+            .palette
+            .as_ref()
+            .map(|palette| palette.query.to_lowercase())
+            .unwrap_or_default();
+        self.actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| {
+                query.is_empty()
+                    || action.name.to_lowercase().contains(&query)
+                    || action.description.to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn palette_echo(&self) -> Option<String> {
+        let palette = self.palette.as_ref()?;
+        let matches = self.palette_matches();
+        let selection = matches.get(palette.selected).map_or_else(
+            || "[no match]".to_owned(),
+            |index| {
+                let action = &self.actions[*index];
+                if action.description.is_empty() {
+                    action.name.clone()
+                } else {
+                    format!("{} — {}", action.name, action.description)
+                }
+            },
+        );
+        Some(format!(
+            "M-x {}  [{}] ({}/{})",
+            palette.query,
+            selection,
+            if matches.is_empty() {
+                0
+            } else {
+                palette.selected + 1
+            },
+            matches.len()
+        ))
+    }
+
     fn message(&mut self, text: impl Into<String>) {
         self.message_for(text, MESSAGE_DURATION);
+    }
+
+    fn toggle_scroll_target(&mut self) -> Effect {
+        self.scroll_target = match self.scroll_target {
+            ScrollTarget::View => ScrollTarget::Desktop,
+            ScrollTarget::Desktop => ScrollTarget::View,
+        };
+        self.scroll_gesture = ScrollGesture::default();
+        self.message(match self.scroll_target {
+            ScrollTarget::View => "Scroll controls viewport",
+            ScrollTarget::Desktop => "Scroll controls remote desktop",
+        });
+        Effect::Chrome
     }
 
     fn error(&mut self, text: impl Into<String>) {
@@ -534,13 +794,7 @@ impl ViewerState {
         layout: DrawLayout,
         now: Instant,
     ) -> Effect {
-        let movement = self.scroll_gesture.consume(
-            events
-                .iter()
-                .copied()
-                .filter(|mouse| mouse.column < layout.cols && mouse.row < layout.rows),
-            now,
-        );
+        let movement = self.scroll_movement(events, layout, now);
         let Some((axis, steps)) = movement else {
             return Effect::None;
         };
@@ -554,6 +808,21 @@ impl ViewerState {
             self.message = None;
         }
         effect
+    }
+
+    fn scroll_movement(
+        &mut self,
+        events: &[MouseEvent],
+        layout: DrawLayout,
+        now: Instant,
+    ) -> Option<(ScrollAxis, i32)> {
+        self.scroll_gesture.consume(
+            events
+                .iter()
+                .copied()
+                .filter(|mouse| mouse.column < layout.cols && mouse.row < layout.rows),
+            now,
+        )
     }
 }
 
@@ -780,6 +1049,15 @@ impl Terminal {
         } else {
             "MOUSE:OFF"
         };
+        let scroll = match state.scroll_target {
+            ScrollTarget::View => "SCROLL:VIEW",
+            ScrollTarget::Desktop => "SCROLL:DESKTOP",
+        };
+        let idle = if state.idle_inhibited {
+            "IDLE:BLOCK"
+        } else {
+            "IDLE:NORMAL"
+        };
         let input_hint = if state.mode == InteractionMode::Input {
             "C-\\ prefix"
         } else if !state.control {
@@ -791,7 +1069,7 @@ impl Terminal {
         };
         let mode_line = fit_status(
             &format!(
-                " - Termway: {output_name}  [{mode} | {mouse}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  r refresh  q quit ",
+                " - Termway: {output_name}  [{mode} | {mouse} | {scroll} | {idle}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  a idle  r refresh  q quit ",
                 state.viewport.zoom,
                 state.viewport.center_x * 100.0,
                 state.viewport.center_y * 100.0,
@@ -800,7 +1078,9 @@ impl Terminal {
             ),
             cols as usize,
         );
-        let signature = (mode_y, mode_line.clone(), state.mouse_armed);
+        let remote_pointer_active =
+            state.mouse_armed || matches!(state.scroll_target, ScrollTarget::Desktop);
+        let signature = (mode_y, mode_line.clone(), remote_pointer_active);
         if self.last_mode_line.as_ref() == Some(&signature) {
             return Ok(());
         }
@@ -808,7 +1088,7 @@ impl Terminal {
             stdout.queue(MoveTo(0, mode_y))?;
             stdout.queue(ResetColor)?;
             stdout.queue(SetAttribute(Attribute::Reverse))?;
-            if state.mouse_armed {
+            if remote_pointer_active {
                 stdout.queue(SetAttribute(Attribute::Bold))?;
             }
             stdout.queue(Print(mode_line))?;
@@ -826,12 +1106,15 @@ impl Terminal {
             return Ok(());
         }
         let echo_y = rows - 1;
+        let palette_echo = state.palette_echo();
         let echo = fit_status(
-            state
-                .message
-                .as_ref()
-                .map(|message| message.text.as_str())
-                .unwrap_or(""),
+            palette_echo.as_deref().unwrap_or_else(|| {
+                state
+                    .message
+                    .as_ref()
+                    .map(|message| message.text.as_str())
+                    .unwrap_or("")
+            }),
             cols as usize,
         );
         let signature = (echo_y, echo.clone());
@@ -986,11 +1269,18 @@ fn map_left_click(
     layout: DrawLayout,
     output: &OutputGeometry,
 ) -> Option<LogicalPoint> {
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left)
-        || mouse.column >= layout.cols
-        || mouse.row >= layout.rows
-        || output.transform != "Normal"
-    {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return None;
+    }
+    map_pointer_position(mouse, layout, output)
+}
+
+fn map_pointer_position(
+    mouse: MouseEvent,
+    layout: DrawLayout,
+    output: &OutputGeometry,
+) -> Option<LogicalPoint> {
+    if mouse.column >= layout.cols || mouse.row >= layout.rows || output.transform != "Normal" {
         return None;
     }
 
@@ -1213,6 +1503,26 @@ mod tests {
     }
 
     #[test]
+    fn idle_inhibit_toggle_requires_control_mode_and_prefix_works() {
+        let mut view_only = ViewerState::new(Viewport::default(), false).unwrap();
+        assert_eq!(view_only.handle_key(key(KeyCode::Char('a'))), Effect::None);
+
+        let mut control = ViewerState::new(Viewport::default(), true).unwrap();
+        assert_eq!(
+            control.handle_key(key(KeyCode::Char('a'))),
+            Effect::ToggleIdleInhibit
+        );
+
+        control.mode = InteractionMode::Input;
+        let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(control.handle_key(prefix), Effect::Chrome);
+        assert_eq!(
+            control.handle_key(key(KeyCode::Char('a'))),
+            Effect::ToggleIdleInhibit
+        );
+    }
+
+    #[test]
     fn keyboard_input_mode_uses_a_prefix_to_recover_commands() {
         let mut state = ViewerState::new(Viewport::default(), true).unwrap();
         assert_eq!(state.handle_key(key(KeyCode::Char('t'))), Effect::Chrome);
@@ -1234,6 +1544,21 @@ mod tests {
     }
 
     #[test]
+    fn input_prefix_exposes_viewport_navigation_commands() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        state.mode = InteractionMode::Input;
+        let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+
+        assert_eq!(state.handle_key(prefix), Effect::Chrome);
+        assert_eq!(state.handle_key(key(KeyCode::Char('5'))), Effect::Redraw);
+        assert_eq!(state.viewport.zoom, 5.0);
+        assert_eq!(state.handle_key(prefix), Effect::Chrome);
+        assert_eq!(state.handle_key(key(KeyCode::Right)), Effect::Redraw);
+        assert_eq!(state.viewport.center_x, 0.54);
+        assert_eq!(state.mode, InteractionMode::Input);
+    }
+
+    #[test]
     fn input_prefix_can_toggle_independent_mouse_control() {
         let mut state = ViewerState::new(Viewport::default(), true).unwrap();
         state.mode = InteractionMode::Input;
@@ -1241,6 +1566,77 @@ mod tests {
         assert_eq!(state.handle_key(prefix), Effect::Chrome);
         assert_eq!(state.handle_key(key(KeyCode::Char('i'))), Effect::Chrome);
         assert!(state.mouse_armed);
+        assert_eq!(state.mode, InteractionMode::Input);
+    }
+
+    #[test]
+    fn scroll_target_is_explicit_and_available_through_the_input_prefix() {
+        let mut view_only = ViewerState::new(Viewport::default(), false).unwrap();
+        assert_eq!(view_only.handle_key(key(KeyCode::Char('s'))), Effect::None);
+        assert_eq!(view_only.scroll_target, ScrollTarget::View);
+
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        assert_eq!(state.handle_key(key(KeyCode::Char('s'))), Effect::Chrome);
+        assert_eq!(state.scroll_target, ScrollTarget::Desktop);
+        state.mode = InteractionMode::Input;
+        let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(prefix), Effect::Chrome);
+        assert_eq!(state.handle_key(key(KeyCode::Char('s'))), Effect::Chrome);
+        assert_eq!(state.scroll_target, ScrollTarget::View);
+        assert_eq!(state.mode, InteractionMode::Input);
+    }
+
+    #[test]
+    fn action_palette_filters_and_executes_configured_commands() {
+        let mut state = ViewerState::new(Viewport::default(), false).unwrap();
+        state.actions = vec![
+            Action {
+                name: "terminal".into(),
+                description: "Open Kitty".into(),
+                command: vec!["kitty".into()],
+            },
+            Action {
+                name: "overview".into(),
+                description: "Toggle niri overview".into(),
+                command: vec!["niri".into()],
+            },
+        ];
+        assert_eq!(state.handle_key(key(KeyCode::Char('x'))), Effect::Chrome);
+        assert!(state.palette.is_some());
+        for character in "term".chars() {
+            assert_eq!(
+                state.handle_key(key(KeyCode::Char(character))),
+                Effect::Chrome
+            );
+        }
+        assert!(
+            state
+                .palette_echo()
+                .unwrap()
+                .contains("terminal — Open Kitty")
+        );
+        assert_eq!(state.handle_key(key(KeyCode::Enter)), Effect::RunAction(0));
+        assert!(state.palette.is_none());
+    }
+
+    #[test]
+    fn input_prefix_opens_palette_and_control_g_cancels_it() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        state.actions.push(Action {
+            name: "test".into(),
+            description: String::new(),
+            command: vec!["true".into()],
+        });
+        state.mode = InteractionMode::Input;
+        let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(prefix), Effect::Chrome);
+        assert_eq!(state.handle_key(key(KeyCode::Char('x'))), Effect::Chrome);
+        assert!(state.palette.is_some());
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            Effect::Chrome
+        );
+        assert!(state.palette.is_none());
         assert_eq!(state.mode, InteractionMode::Input);
     }
 
@@ -1278,6 +1674,13 @@ mod tests {
             })
         );
         assert_eq!(encode_key(key(KeyCode::Char('你'))), None);
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+            Some(EncodedKey {
+                keycode: 57,
+                modifiers: MOD_CONTROL,
+            })
+        );
     }
 
     #[test]

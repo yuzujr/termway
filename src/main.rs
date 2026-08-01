@@ -1,5 +1,7 @@
 mod capture;
+mod config;
 mod discovery;
+mod idle;
 mod input;
 mod niri;
 mod render;
@@ -19,6 +21,10 @@ struct Cli {
     /// Override niri's IPC socket discovery.
     #[arg(long, global = true, value_name = "PATH")]
     niri_socket: Option<PathBuf>,
+
+    /// Read actions from this file instead of the default XDG config path.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -85,6 +91,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config = config::load(cli.config.as_deref())?;
     let discovered = discovery::discover(cli.niri_socket.as_deref())?;
 
     match cli.command.unwrap_or(Command::Doctor) {
@@ -104,7 +111,15 @@ fn main() -> Result<()> {
             center_x,
             center_y,
             control,
-        } => view(discovered, output, zoom, center_x, center_y, control),
+        } => view(
+            discovered,
+            output,
+            zoom,
+            center_x,
+            center_y,
+            control,
+            config.actions,
+        ),
     }
 }
 
@@ -115,6 +130,7 @@ fn view(
     center_x: f32,
     center_y: f32,
     control: bool,
+    actions: Vec<config::Action>,
 ) -> Result<()> {
     let display = discovered
         .wayland_display
@@ -132,6 +148,11 @@ fn view(
             zoom,
             center_x,
             center_y,
+        },
+        viewer::ActionOptions {
+            actions,
+            niri_socket: &discovered.socket_path,
+            environment: &discovered.action_environment,
         },
     )
 }

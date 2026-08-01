@@ -20,6 +20,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 };
 
 const BTN_LEFT: u32 = 0x110;
+const SCROLL_DISTANCE_PER_STEP: f64 = 15.0;
 const XKB_KEYMAP: &str = concat!(
     "xkb_keymap {\n",
     "  xkb_keycodes { include \"evdev+aliases(qwerty)\" };\n",
@@ -129,6 +130,42 @@ impl VirtualPointer {
         self.connection
             .flush()
             .context("cannot send virtual click")?;
+        Ok(())
+    }
+
+    pub fn scroll(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        horizontal: bool,
+        steps: i32,
+    ) -> Result<()> {
+        if width == 0 || height == 0 || x >= width || y >= height {
+            bail!("refusing out-of-bounds pointer coordinate ({x},{y}) in {width}x{height}");
+        }
+        if steps == 0 {
+            return Ok(());
+        }
+        let time = self.started.elapsed().as_millis() as u32;
+        let axis = if horizontal {
+            wl_pointer::Axis::HorizontalScroll
+        } else {
+            wl_pointer::Axis::VerticalScroll
+        };
+        self.pointer.motion_absolute(time, x, y, width, height);
+        self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
+        self.pointer.axis_discrete(
+            time,
+            axis,
+            f64::from(steps) * SCROLL_DISTANCE_PER_STEP,
+            steps,
+        );
+        self.pointer.frame();
+        self.connection
+            .flush()
+            .context("cannot send virtual scroll")?;
         Ok(())
     }
 }

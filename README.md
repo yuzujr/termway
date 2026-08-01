@@ -81,6 +81,9 @@ nix develop --command cargo run --release -- view
 - 鼠标左键：向点击位置移动 viewport，并放大一级；
 - 鼠标滚轮或触控板上下滚动：垂直平移 viewport；
 - 触控板左右滚动：水平平移 viewport（取决于终端是否发送水平滚动事件）；
+- `s`（需要 `--control`）：切换滚动控制 viewport 或远端桌面；
+- `a`（需要 `--control`）：切换是否阻止远端桌面进入 idle；
+- `x`：打开配置驱动的 action palette；
 - `q`、Esc、Ctrl-C、Ctrl-D：退出。
 
 鼠标事件使用终端的 SGR mouse protocol。tmux 会把事件转换成 pane 内坐标，因此 pane
@@ -101,7 +104,7 @@ viewer 有两个互斥交互模式，鼠标控制则是独立的安全开关：
 nix develop --command cargo run --release -- view --control
 ```
 
-启动时为 `[NAV | MOUSE:OFF]`。在 NAV 中按 `i` 切换 `MOUSE:OFF/ON`；只有
+启动时为 `[NAV | MOUSE:OFF | SCROLL:VIEW]`。在 NAV 中按 `i` 切换 `MOUSE:OFF/ON`；只有
 `MOUSE:ON` 状态下的左键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
 点击后会自动刷新一帧。该路径使用 Wayland 绝对坐标，不依赖 `ydotool`、`/dev/uinput`
 或鼠标加速度。当前输入映射仅支持 niri 的 `Normal` output transform。
@@ -113,6 +116,11 @@ keyboard 发送给当前聚焦的远端窗口。输入模式使用 `Ctrl-\` 作�
 - `Ctrl-\ r`：刷新画面；
 - `Ctrl-\ q`：退出 termway；
 - `Ctrl-\ i`：切换 `MOUSE:OFF/ON`；
+- `Ctrl-\ s`：切换 `SCROLL:VIEW/DESKTOP`；
+- `Ctrl-\ a`：切换远端 idle inhibit；
+- `Ctrl-\ x`：打开 action palette；
+- `Ctrl-\` 后接 `+`、`-`、`0`–`9`、`c`、方向键或 `hjkl`：在 INPUT
+  模式中缩放、复位或平移 viewport；
 - 连按两次 `Ctrl-\`：向远端发送一次 `Ctrl-\`。
 
 在 legacy terminal keyboard protocol 中，`Ctrl-\` 与 `Ctrl-4` 都编码为 `0x1c`，
@@ -121,6 +129,58 @@ termway 会将这个字节统一解释为前缀；支持增强键盘协议的终
 ASCII、方向/navigation、F1–F12 以及 Shift、Control、Alt、Super 使用 US evdev keymap。
 非 ASCII 字符使用独立的动态 XKB keymap，将终端收到的 Unicode code point 直接发送给
 远端应用，不依赖远端输入法。
+
+Mac 的 Option 可以在终端配置允许时作为 Alt 发送；Command/Super 通常由本地终端处理，
+无法可靠穿过 SSH。Wayland virtual keyboard 可以把组合键发给聚焦应用，但不能触发
+niri 的 compositor-global bindings；这类入口适合放进 action palette。
+
+`view --control` 默认通过 `org.freedesktop.ScreenSaver` 阻止远端进入 idle，modeline
+显示 `IDLE:BLOCK`。退出 viewer 会自动解除；如果要把 viewer 留在 detach 的 tmux pane
+中并允许正常锁屏，请先按 `a`（INPUT 中按 `Ctrl-\ a`）切到 `IDLE:NORMAL`。只读 viewer
+不会改变 idle 行为。
+
+## Action palette
+
+termway 不内建任何 niri action。palette 完全由配置文件驱动，每个条目都是一个普通
+argv command，因此也可以用于其他 compositor、脚本或任意程序。默认读取：
+
+```text
+~/.config/termway/config.toml
+```
+
+也可以显式指定：
+
+```console
+termway --config /path/to/config.toml view --control
+```
+
+完整示例见 [`examples/config.toml`](examples/config.toml)，可这样安装：
+
+```console
+mkdir -p ~/.config/termway
+cp examples/config.toml ~/.config/termway/config.toml
+```
+
+示例根据当前 niri 配置提供 Kitty、Noctalia launcher/clipboard、Dolphin、Chrome，以及
+overview、窗口和工作区操作。niri 项也只是普通命令，例如：
+
+```toml
+[[actions]]
+name = "overview"
+description = "Toggle the niri overview"
+command = ["niri", "msg", "action", "toggle-overview"]
+```
+
+在 NAV 中按 `x`，或在 INPUT 中按 `Ctrl-\ x` 打开。输入字符过滤 name 和
+description；Tab/Down 与 BackTab/Up 切换候选，Enter 执行，Esc 或 Ctrl-G 取消。
+termway 会为子进程补齐已发现的 `XDG_RUNTIME_DIR`、`WAYLAND_DISPLAY`、
+`NIRI_SOCKET`，并从本地图形会话补齐 `DISPLAY`、session D-Bus 等桌面环境变量；因此
+从 SSH 启动 Chrome 这类应用时不会错误继承 SSH 会话。配置缺失时 viewer 仍可正常使用，
+只会在打开 palette 时给出提示。
+
+滚动目标独立于 NAV/INPUT 和点击安全开关。默认 `SCROLL:VIEW` 保留触控板导航体验；
+切到 `SCROLL:DESKTOP` 后，termway 会将滚动位置映射到远端 output，再通过 wlr virtual
+pointer 发送水平或垂直 wheel axis。滚动仍使用事件合并、手势轴锁和每帧限幅。
 原生 damage watcher 可用时，键盘输入和点击产生的画面变化由 compositor 自动报告，
 不会额外发起前台 capture。回退到 grim 或 watcher 运行失败时，键盘输入会启用 250ms
 debounce，点击后也会主动捕获，维持相同的基本交互能力。显式 `Ctrl-\ r` 始终强制立即

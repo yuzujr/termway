@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
@@ -36,8 +36,18 @@ pub struct GraphicalSession {
     pub runtime_dir: PathBuf,
     pub socket_path: PathBuf,
     pub wayland_display: Option<String>,
+    pub action_environment: Vec<(OsString, OsString)>,
     pub source: Source,
 }
+
+const GRAPHICAL_ENVIRONMENT_KEYS: &[&str] = &[
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "XAUTHORITY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+];
 
 pub fn discover(override_socket: Option<&Path>) -> Result<GraphicalSession> {
     let process_env = env::vars_os().collect::<HashMap<_, _>>();
@@ -111,12 +121,31 @@ fn session(
     let wayland_display = value(process_env, "WAYLAND_DISPLAY")
         .or_else(|| value(systemd_env, "WAYLAND_DISPLAY"))
         .or_else(|| display_from_socket(&socket_path));
+    let action_environment = graphical_environment(process_env, systemd_env);
     GraphicalSession {
         runtime_dir,
         socket_path,
         wayland_display,
+        action_environment,
         source,
     }
+}
+
+fn graphical_environment(
+    process_env: &HashMap<OsString, OsString>,
+    systemd_env: &HashMap<OsString, OsString>,
+) -> Vec<(OsString, OsString)> {
+    GRAPHICAL_ENVIRONMENT_KEYS
+        .iter()
+        .filter_map(|key| {
+            // The systemd user manager belongs to the local graphical session.
+            // Prefer it over values such as an SSH-forwarded DISPLAY.
+            systemd_env
+                .get(OsStr::new(key))
+                .or_else(|| process_env.get(OsStr::new(key)))
+                .map(|value| (OsString::from(key), value.clone()))
+        })
+        .collect()
 }
 
 fn runtime_dir(
@@ -257,5 +286,40 @@ mod tests {
     fn refuses_ambiguous_sessions() {
         let candidates = vec![PathBuf::from("a"), PathBuf::from("b")];
         assert!(select_candidate(&candidates, None).is_err());
+    }
+
+    #[test]
+    fn graphical_environment_prefers_local_systemd_session() {
+        let process = HashMap::from([
+            (OsString::from("DISPLAY"), OsString::from("localhost:10.0")),
+            (
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from("ssh-bus"),
+            ),
+        ]);
+        let systemd = HashMap::from([
+            (OsString::from("DISPLAY"), OsString::from(":0")),
+            (
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from("local-bus"),
+            ),
+            (
+                OsString::from("UNRELATED_SECRET"),
+                OsString::from("ignored"),
+            ),
+        ]);
+
+        let environment = graphical_environment(&process, &systemd)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new("DISPLAY")),
+            Some(&OsString::from(":0"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
+            Some(&OsString::from("local-bus"))
+        );
+        assert!(!environment.contains_key(OsStr::new("UNRELATED_SECRET")));
     }
 }
