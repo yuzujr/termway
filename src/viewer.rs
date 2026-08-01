@@ -19,7 +19,7 @@ use crossterm::{ExecutableCommand, QueueableCommand, SynchronizedUpdate};
 use image::RgbImage;
 
 use crate::capture;
-use crate::input::VirtualPointer;
+use crate::input::{VirtualKeyboard, VirtualPointer};
 use crate::niri::OutputGeometry;
 use crate::render::{self, Viewport, ViewportRect};
 
@@ -34,6 +34,7 @@ const SCROLL_GESTURE_TIMEOUT: Duration = Duration::from_millis(80);
 const SCROLL_STEP_SCALE: f32 = 0.25;
 const MAX_SCROLL_STEPS_PER_FRAME: i32 = 4;
 const AXIS_SWITCH_THRESHOLD: i32 = 2;
+const AUTO_REFRESH_DELAY: Duration = Duration::from_millis(250);
 
 pub fn run(
     runtime_dir: &Path,
@@ -49,6 +50,9 @@ pub fn run(
     let pointer = control
         .then(|| VirtualPointer::connect(runtime_dir, wayland_display, output_name))
         .transpose()?;
+    let mut keyboard = control
+        .then(|| VirtualKeyboard::connect(runtime_dir, wayland_display))
+        .transpose()?;
     let mut terminal = Terminal::enter()?;
     let mut layout = terminal.draw(&frame, output_name, &state)?;
     let mut pending_events = VecDeque::new();
@@ -57,12 +61,30 @@ pub fn run(
         let terminal_event = if let Some(pending) = pending_events.pop_front() {
             pending
         } else {
-            if let Some(timeout) = state.message_timeout()
+            if let Some(timeout) = state.next_wakeup_timeout()
                 && (timeout.is_zero()
                     || !event::poll(timeout).context("cannot poll terminal events")?)
             {
+                let auto_refresh = state.take_due_auto_refresh();
                 state.expire_message();
-                terminal.draw_echo(&state)?;
+                if auto_refresh {
+                    match capture::capture_with_grim(
+                        runtime_dir,
+                        wayland_display,
+                        Some(output_name),
+                    ) {
+                        Ok(new_frame) => {
+                            frame = new_frame;
+                            layout = terminal.draw(&frame, output_name, &state)?;
+                        }
+                        Err(error) => {
+                            state.error(format!("Auto-refresh failed: {error:#}"));
+                            terminal.draw_echo(&state)?;
+                        }
+                    }
+                } else {
+                    terminal.draw_echo(&state)?;
+                }
                 continue;
             }
             event::read().context("cannot read a terminal event")?
@@ -72,6 +94,7 @@ pub fn run(
                 match state.handle_key(key) {
                     Effect::Quit => break,
                     Effect::Refresh => {
+                        state.cancel_auto_refresh();
                         let refreshed = match capture::capture_with_grim(
                             runtime_dir,
                             wayland_display,
@@ -95,6 +118,28 @@ pub fn run(
                     }
                     Effect::Redraw => layout = terminal.draw(&frame, output_name, &state)?,
                     Effect::Chrome => terminal.draw_chrome(output_name, &state, layout)?,
+                    Effect::SendKey(encoded) => {
+                        if let Some(keyboard) = &keyboard {
+                            match keyboard.key(encoded.keycode, encoded.modifiers) {
+                                Ok(()) => state.schedule_auto_refresh(),
+                                Err(error) => {
+                                    state.error(format!("Key injection failed: {error:#}"));
+                                    terminal.draw_echo(&state)?;
+                                }
+                            }
+                        }
+                    }
+                    Effect::SendUnicode(character) => {
+                        if let Some(keyboard) = &mut keyboard {
+                            match keyboard.unicode(character) {
+                                Ok(()) => state.schedule_auto_refresh(),
+                                Err(error) => {
+                                    state.error(format!("Unicode injection failed: {error:#}"));
+                                    terminal.draw_echo(&state)?;
+                                }
+                            }
+                        }
+                    }
                     Effect::None => {}
                 }
             }
@@ -174,6 +219,9 @@ struct ViewerState {
     message: Option<EchoMessage>,
     control: bool,
     armed: bool,
+    keyboard_input: bool,
+    prefix_pending: bool,
+    auto_refresh_at: Option<Instant>,
     scroll_gesture: ScrollGesture,
 }
 
@@ -188,6 +236,8 @@ enum Effect {
     None,
     Redraw,
     Chrome,
+    SendKey(EncodedKey),
+    SendUnicode(char),
     Refresh,
     Quit,
 }
@@ -200,6 +250,9 @@ impl ViewerState {
             message: None,
             control,
             armed: false,
+            keyboard_input: false,
+            prefix_pending: false,
+            auto_refresh_at: None,
             scroll_gesture: ScrollGesture::default(),
         };
         state.clamp_center();
@@ -207,6 +260,9 @@ impl ViewerState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Effect {
+        if self.keyboard_input {
+            return self.handle_input_key(key);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'd'))
         {
@@ -216,6 +272,12 @@ impl ViewerState {
         let effect = match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Effect::Quit,
             KeyCode::Char('r') => Effect::Refresh,
+            KeyCode::Char('t') if self.control => {
+                self.keyboard_input = true;
+                self.prefix_pending = false;
+                self.message("Keyboard input enabled; use C-\\ t to return");
+                Effect::Chrome
+            }
             KeyCode::Char('i') if self.control => {
                 self.armed = !self.armed;
                 self.message(if self.armed {
@@ -244,6 +306,48 @@ impl ViewerState {
         effect
     }
 
+    fn handle_input_key(&mut self, key: KeyEvent) -> Effect {
+        if self.prefix_pending {
+            self.prefix_pending = false;
+            if is_command_prefix(key) {
+                return Effect::SendKey(EncodedKey {
+                    keycode: 43,
+                    modifiers: MOD_CONTROL,
+                });
+            }
+            return match key.code {
+                KeyCode::Char('t') => {
+                    self.keyboard_input = false;
+                    self.message("Keyboard input disabled");
+                    Effect::Chrome
+                }
+                KeyCode::Char('q') => Effect::Quit,
+                KeyCode::Char('r') => Effect::Refresh,
+                _ => {
+                    self.error(format!("Undefined prefix key: C-\\ {:?}", key.code));
+                    Effect::Chrome
+                }
+            };
+        }
+        if is_command_prefix(key) {
+            self.prefix_pending = true;
+            self.message("C-\\-");
+            return Effect::Chrome;
+        }
+        if let KeyCode::Char(character) = key.code
+            && !character.is_ascii()
+        {
+            return Effect::SendUnicode(character);
+        }
+        match encode_key(key) {
+            Some(encoded) => Effect::SendKey(encoded),
+            None => {
+                self.error(format!("Unsupported key: {:?}", key.code));
+                Effect::Chrome
+            }
+        }
+    }
+
     fn message(&mut self, text: impl Into<String>) {
         self.message_for(text, MESSAGE_DURATION);
     }
@@ -259,10 +363,16 @@ impl ViewerState {
         });
     }
 
-    fn message_timeout(&self) -> Option<Duration> {
-        self.message
-            .as_ref()
-            .map(|message| message.expires_at.saturating_duration_since(Instant::now()))
+    fn next_wakeup_timeout(&self) -> Option<Duration> {
+        let now = Instant::now();
+        [
+            self.message.as_ref().map(|message| message.expires_at),
+            self.auto_refresh_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|deadline| deadline.saturating_duration_since(now))
     }
 
     fn expire_message(&mut self) {
@@ -272,6 +382,26 @@ impl ViewerState {
             .is_some_and(|message| message.expires_at <= Instant::now())
         {
             self.message = None;
+        }
+    }
+
+    fn schedule_auto_refresh(&mut self) {
+        self.auto_refresh_at = Some(Instant::now() + AUTO_REFRESH_DELAY);
+    }
+
+    fn cancel_auto_refresh(&mut self) {
+        self.auto_refresh_at = None;
+    }
+
+    fn take_due_auto_refresh(&mut self) -> bool {
+        if self
+            .auto_refresh_at
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.auto_refresh_at = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -573,12 +703,18 @@ impl Terminal {
         let mode_y = rows.saturating_sub(2);
         let mode = if !state.control {
             "VIEW"
+        } else if state.keyboard_input && state.armed {
+            "INPUT:MOUSE"
+        } else if state.keyboard_input {
+            "INPUT"
         } else if state.armed {
             "CONTROL:ARMED"
         } else {
             "CONTROL:OFF"
         };
-        let input_hint = if !state.control {
+        let input_hint = if state.keyboard_input {
+            "C-\\ prefix"
+        } else if !state.control {
             "click inspect"
         } else if state.armed {
             "i disarm"
@@ -644,6 +780,104 @@ impl Terminal {
         self.last_echo = Some(signature);
         Ok(())
     }
+}
+
+const MOD_SHIFT: u32 = 1 << 0;
+const MOD_CONTROL: u32 = 1 << 2;
+const MOD_ALT: u32 = 1 << 3;
+const MOD_SUPER: u32 = 1 << 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncodedKey {
+    keycode: u32,
+    modifiers: u32,
+}
+
+fn is_command_prefix(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('\\' | '4')) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn encode_key(key: KeyEvent) -> Option<EncodedKey> {
+    let mut modifiers = 0;
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        modifiers |= MOD_SHIFT;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        modifiers |= MOD_CONTROL;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        modifiers |= MOD_ALT;
+    }
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        modifiers |= MOD_SUPER;
+    }
+
+    let (keycode, implied_shift) = match key.code {
+        KeyCode::Backspace => (14, false),
+        KeyCode::Enter => (28, false),
+        KeyCode::Left => (105, false),
+        KeyCode::Right => (106, false),
+        KeyCode::Up => (103, false),
+        KeyCode::Down => (108, false),
+        KeyCode::Home => (102, false),
+        KeyCode::End => (107, false),
+        KeyCode::PageUp => (104, false),
+        KeyCode::PageDown => (109, false),
+        KeyCode::Tab => (15, false),
+        KeyCode::BackTab => (15, true),
+        KeyCode::Delete => (111, false),
+        KeyCode::Insert => (110, false),
+        KeyCode::Esc => (1, false),
+        KeyCode::F(number @ 1..=10) => (58 + u32::from(number), false),
+        KeyCode::F(11) => (87, false),
+        KeyCode::F(12) => (88, false),
+        KeyCode::Char(character) => char_keycode(character)?,
+        _ => return None,
+    };
+    if implied_shift {
+        modifiers |= MOD_SHIFT;
+    }
+    Some(EncodedKey { keycode, modifiers })
+}
+
+fn char_keycode(character: char) -> Option<(u32, bool)> {
+    let shifted = character.is_ascii_uppercase();
+    let lower = character.to_ascii_lowercase();
+    let letter = "qwertyuiop"
+        .find(lower)
+        .map(|index| 16 + index as u32)
+        .or_else(|| "asdfghjkl".find(lower).map(|index| 30 + index as u32))
+        .or_else(|| "zxcvbnm".find(lower).map(|index| 44 + index as u32));
+    if let Some(keycode) = letter {
+        return Some((keycode, shifted));
+    }
+    Some(match character {
+        '1'..='9' => (2 + u32::from(character as u8 - b'1'), false),
+        '0' => (11, false),
+        '!' => (2, true),
+        '@' => (3, true),
+        '#' => (4, true),
+        '$' => (5, true),
+        '%' => (6, true),
+        '^' => (7, true),
+        '&' => (8, true),
+        '*' => (9, true),
+        '(' => (10, true),
+        ')' => (11, true),
+        '-' | '_' => (12, character == '_'),
+        '=' | '+' => (13, character == '+'),
+        '[' | '{' => (26, character == '{'),
+        ']' | '}' => (27, character == '}'),
+        ';' | ':' => (39, character == ':'),
+        '\'' | '"' => (40, character == '"'),
+        '`' | '~' => (41, character == '~'),
+        '\\' | '|' => (43, character == '|'),
+        ',' | '<' => (51, character == '<'),
+        '.' | '>' => (52, character == '>'),
+        '/' | '?' => (53, character == '?'),
+        ' ' => (57, false),
+        _ => return None,
+    })
 }
 
 impl Drop for Terminal {
@@ -825,6 +1059,98 @@ mod tests {
         assert!(control.armed);
         assert_eq!(control.handle_key(key(KeyCode::Char('i'))), Effect::Chrome);
         assert!(!control.armed);
+    }
+
+    #[test]
+    fn keyboard_input_mode_uses_a_prefix_to_recover_commands() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        assert_eq!(state.handle_key(key(KeyCode::Char('t'))), Effect::Chrome);
+        assert!(state.keyboard_input);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('q'))),
+            Effect::SendKey(EncodedKey {
+                keycode: 16,
+                modifiers: 0,
+            })
+        );
+
+        let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(prefix), Effect::Chrome);
+        assert!(state.prefix_pending);
+        assert_eq!(state.handle_key(key(KeyCode::Char('t'))), Effect::Chrome);
+        assert!(!state.keyboard_input);
+        assert!(!state.prefix_pending);
+    }
+
+    #[test]
+    fn encodes_ascii_navigation_and_modifiers_as_evdev_keys() {
+        assert_eq!(
+            encode_key(key(KeyCode::Char('A'))),
+            Some(EncodedKey {
+                keycode: 30,
+                modifiers: MOD_SHIFT,
+            })
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            Some(EncodedKey {
+                keycode: 46,
+                modifiers: MOD_CONTROL | MOD_ALT,
+            })
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char('?'))),
+            Some(EncodedKey {
+                keycode: 53,
+                modifiers: MOD_SHIFT,
+            })
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Left)),
+            Some(EncodedKey {
+                keycode: 105,
+                modifiers: 0,
+            })
+        );
+        assert_eq!(encode_key(key(KeyCode::Char('你'))), None);
+    }
+
+    #[test]
+    fn doubled_command_prefix_is_sent_to_the_desktop() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        state.keyboard_input = true;
+        let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(prefix), Effect::Chrome);
+        assert_eq!(
+            state.handle_key(prefix),
+            Effect::SendKey(EncodedKey {
+                keycode: 43,
+                modifiers: MOD_CONTROL,
+            })
+        );
+    }
+
+    #[test]
+    fn non_ascii_characters_use_dynamic_unicode_keys() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        state.keyboard_input = true;
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('你'))),
+            Effect::SendUnicode('你')
+        );
+    }
+
+    #[test]
+    fn auto_refresh_deadline_is_consumed_once() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        state.auto_refresh_at = Some(Instant::now() - Duration::from_millis(1));
+        assert!(state.next_wakeup_timeout().unwrap().is_zero());
+        assert!(state.take_due_auto_refresh());
+        assert!(!state.take_due_auto_refresh());
+        assert!(state.next_wakeup_timeout().is_none());
     }
 
     #[test]

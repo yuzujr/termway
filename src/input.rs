@@ -1,23 +1,53 @@
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use rustix::fs::{MemfdFlags, memfd_create};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
-use wayland_client::protocol::{wl_output, wl_pointer, wl_registry};
+use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
 const BTN_LEFT: u32 = 0x110;
+const XKB_KEYMAP: &str = concat!(
+    "xkb_keymap {\n",
+    "  xkb_keycodes { include \"evdev+aliases(qwerty)\" };\n",
+    "  xkb_types { include \"complete\" };\n",
+    "  xkb_compat { include \"complete\" };\n",
+    "  xkb_symbols { include \"pc+us+inet(evdev)\" };\n",
+    "  xkb_geometry { include \"pc(pc105)\" };\n",
+    "};\n\0",
+);
 
 pub struct VirtualPointer {
     connection: Connection,
     _queue: EventQueue<InputState>,
     _manager: ZwlrVirtualPointerManagerV1,
     pointer: ZwlrVirtualPointerV1,
+    started: Instant,
+}
+
+pub struct VirtualKeyboard {
+    connection: Connection,
+    _queue: EventQueue<InputState>,
+    _manager: ZwpVirtualKeyboardManagerV1,
+    _seat: wl_seat::WlSeat,
+    keyboard: ZwpVirtualKeyboardV1,
+    unicode_keyboard: ZwpVirtualKeyboardV1,
+    _keymap: File,
+    unicode_keymap: Option<File>,
+    unicode_chars: Vec<char>,
     started: Instant,
 }
 
@@ -103,6 +133,149 @@ impl VirtualPointer {
     }
 }
 
+impl VirtualKeyboard {
+    pub fn connect(runtime_dir: &Path, display: &str) -> Result<Self> {
+        let connection = connect_wayland(runtime_dir, display)?;
+        let (globals, queue) = registry_queue_init::<InputState>(&connection)
+            .context("cannot read Wayland globals")?;
+        let qh = queue.handle();
+        let manager: ZwpVirtualKeyboardManagerV1 = globals
+            .bind(&qh, 1..=1, ())
+            .context("compositor does not support virtual keyboard v1")?;
+        let seat_global = globals
+            .contents()
+            .clone_list()
+            .into_iter()
+            .find(|global| global.interface == wl_seat::WlSeat::interface().name)
+            .context("Wayland compositor has no seat")?;
+        let seat = globals.registry().bind::<wl_seat::WlSeat, _, _>(
+            seat_global.name,
+            seat_global.version.min(1),
+            &qh,
+            (),
+        );
+        let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
+        let unicode_keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
+        let keymap = send_keymap(&keyboard)?;
+        connection
+            .flush()
+            .context("cannot create virtual keyboard")?;
+        Ok(Self {
+            connection,
+            _queue: queue,
+            _manager: manager,
+            _seat: seat,
+            keyboard,
+            unicode_keyboard,
+            _keymap: keymap,
+            unicode_keymap: None,
+            unicode_chars: Vec::new(),
+            started: Instant::now(),
+        })
+    }
+
+    pub fn key(&self, keycode: u32, modifiers: u32) -> Result<()> {
+        let time = self.started.elapsed().as_millis() as u32;
+        self.keyboard.modifiers(modifiers, 0, 0, 0);
+        self.keyboard
+            .key(time, keycode, wl_keyboard::KeyState::Pressed.into());
+        self.keyboard
+            .key(time, keycode, wl_keyboard::KeyState::Released.into());
+        self.keyboard.modifiers(0, 0, 0, 0);
+        self.connection.flush().context("cannot send virtual key")?;
+        Ok(())
+    }
+
+    pub fn unicode(&mut self, character: char) -> Result<()> {
+        let keycode = match self
+            .unicode_chars
+            .iter()
+            .position(|entry| *entry == character)
+        {
+            Some(index) => index as u32 + 1,
+            None => {
+                if self.unicode_chars.len() >= 512 {
+                    self.unicode_chars.clear();
+                }
+                self.unicode_chars.push(character);
+                let keymap = unicode_keymap(&self.unicode_chars);
+                self.unicode_keymap = Some(send_keymap_text(&self.unicode_keyboard, &keymap)?);
+                self.unicode_chars.len() as u32
+            }
+        };
+        let time = self.started.elapsed().as_millis() as u32;
+        self.unicode_keyboard.modifiers(0, 0, 0, 0);
+        self.unicode_keyboard
+            .key(time, keycode, wl_keyboard::KeyState::Pressed.into());
+        self.unicode_keyboard
+            .key(time, keycode, wl_keyboard::KeyState::Released.into());
+        self.connection
+            .flush()
+            .context("cannot send Unicode virtual key")?;
+        Ok(())
+    }
+}
+
+fn connect_wayland(runtime_dir: &Path, display: &str) -> Result<Connection> {
+    let socket_path = if Path::new(display).is_absolute() {
+        Path::new(display).to_path_buf()
+    } else {
+        runtime_dir.join(display)
+    };
+    let socket = UnixStream::connect(&socket_path)
+        .with_context(|| format!("cannot connect to Wayland at {}", socket_path.display()))?;
+    Connection::from_socket(socket).context("cannot initialize Wayland")
+}
+
+fn send_keymap(keyboard: &ZwpVirtualKeyboardV1) -> Result<File> {
+    send_keymap_text(keyboard, XKB_KEYMAP)
+}
+
+fn send_keymap_text(keyboard: &ZwpVirtualKeyboardV1, keymap: &str) -> Result<File> {
+    let fd = memfd_create(c"termway-keymap", MemfdFlags::CLOEXEC)
+        .context("cannot create keymap memory file")?;
+    let mut file = File::from(fd);
+    file.write_all(keymap.as_bytes())
+        .context("cannot write virtual keyboard keymap")?;
+    keyboard.keymap(
+        wl_keyboard::KeymapFormat::XkbV1.into(),
+        file.as_fd(),
+        keymap.len() as u32,
+    );
+    Ok(file)
+}
+
+fn unicode_keymap(characters: &[char]) -> String {
+    use std::fmt::Write as _;
+
+    let mut keymap = String::from(
+        "xkb_keymap {\n\
+         xkb_keycodes \"termway\" {\n\
+         minimum = 8;\n",
+    );
+    writeln!(keymap, "maximum = {};", characters.len() + 9).unwrap();
+    for index in 0..characters.len() {
+        writeln!(keymap, "<K{}> = {};", index + 1, index + 9).unwrap();
+    }
+    keymap.push_str(
+        "};\n\
+         xkb_types \"termway\" { include \"complete\" };\n\
+         xkb_compatibility \"termway\" { include \"complete\" };\n\
+         xkb_symbols \"termway\" {\n",
+    );
+    for (index, character) in characters.iter().enumerate() {
+        writeln!(
+            keymap,
+            "key <K{}> {{ [ U{:04X} ] }};",
+            index + 1,
+            u32::from(*character)
+        )
+        .unwrap();
+    }
+    keymap.push_str("};\n};\n\0");
+    keymap
+}
+
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for InputState {
     fn event(
         _: &mut Self,
@@ -137,3 +310,20 @@ impl Dispatch<wl_output::WlOutput, ()> for InputState {
 
 delegate_noop!(InputState: ignore ZwlrVirtualPointerManagerV1);
 delegate_noop!(InputState: ignore ZwlrVirtualPointerV1);
+delegate_noop!(InputState: ignore ZwpVirtualKeyboardManagerV1);
+delegate_noop!(InputState: ignore ZwpVirtualKeyboardV1);
+delegate_noop!(InputState: ignore wl_seat::WlSeat);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_unicode_xkb_keymap() {
+        let keymap = unicode_keymap(&['你', '😀']);
+        assert!(keymap.contains("<K1> = 9;"));
+        assert!(keymap.contains("key <K1> { [ U4F60 ] };"));
+        assert!(keymap.contains("key <K2> { [ U1F600 ] };"));
+        assert!(keymap.ends_with('\0'));
+    }
+}

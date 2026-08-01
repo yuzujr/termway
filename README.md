@@ -88,6 +88,23 @@ control mode 启动时仍是 `CONTROL:OFF`。按 `i` 切换 armed/disarmed；只
 点击后会自动刷新一帧。该路径使用 Wayland 绝对坐标，不依赖 `ydotool`、`/dev/uinput`
 或鼠标加速度。当前输入映射仅支持 niri 的 `Normal` output transform。
 
+在 `--control` 模式下按 `t` 进入 `[INPUT]`，键盘事件会通过 Wayland virtual
+keyboard 发送给当前聚焦的远端窗口。输入模式使用 `Ctrl-\` 作为 termway 前缀：
+
+- `Ctrl-\ t`：返回 command mode；
+- `Ctrl-\ r`：刷新画面；
+- `Ctrl-\ q`：退出 termway；
+- 连按两次 `Ctrl-\`：向远端发送一次 `Ctrl-\`。
+
+在 legacy terminal keyboard protocol 中，`Ctrl-\` 与 `Ctrl-4` 都编码为 `0x1c`，
+termway 会将这个字节统一解释为前缀；支持增强键盘协议的终端则没有这项歧义。
+
+ASCII、方向/navigation、F1–F12 以及 Shift、Control、Alt、Super 使用 US evdev keymap。
+非 ASCII 字符使用独立的动态 XKB keymap，将终端收到的 Unicode code point 直接发送给
+远端应用，不依赖远端输入法。
+成功发送键盘输入后会启动 250ms debounce；期间有新按键就重新计时，输入停止后自动
+捕获并重绘一帧。显式 `Ctrl-\ r` 会取消尚未触发的自动刷新，避免重复捕获。
+
 底部采用 Emacs 式两层信息区：mode line 持续显示当前模式、输出、倍率和 viewport；
 echo area 显示刷新结果、点击坐标和错误。普通消息 2 秒后自动清空，错误保留 5 秒，
 不会覆盖 mode line 中的控制状态。
