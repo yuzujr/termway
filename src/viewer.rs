@@ -36,6 +36,7 @@ const MAX_SCROLL_STEPS_PER_FRAME: i32 = 4;
 const AXIS_SWITCH_THRESHOLD: i32 = 2;
 const AUTO_REFRESH_DELAY: Duration = Duration::from_millis(250);
 const CLICK_FOCUS_FRACTION: f32 = 0.4;
+const DAMAGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 
 pub fn run(
     runtime_dir: &Path,
@@ -51,6 +52,17 @@ pub fn run(
     if let Some(reason) = capturer.fallback_reason() {
         state.message(format!("Using grim fallback: {reason}"));
     }
+    let mut damage_watcher = if capturer.backend_name() == "wlr-screencopy" {
+        match capture::DamageWatcher::spawn(runtime_dir, wayland_display, output_name) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                state.message(format!("Live updates disabled: {error:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     validate_output_geometry(&frame, &output_geometry)?;
     let pointer = control
         .then(|| VirtualPointer::connect(runtime_dir, wayland_display, output_name))
@@ -63,15 +75,45 @@ pub fn run(
     let mut pending_events = VecDeque::new();
 
     loop {
+        if let Some(watcher) = &damage_watcher {
+            match watcher.take_latest() {
+                Ok(Some(update)) => {
+                    validate_output_geometry(&update.image, &output_geometry)?;
+                    let redraw = damage_affects_viewport(&update.damage, layout.viewport)
+                        && visible_region_changed(&frame, &update.image, layout.viewport);
+                    frame = update.image;
+                    if redraw {
+                        state.cancel_auto_refresh();
+                        layout = terminal.draw(&frame, output_name, &state)?;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    state.error(format!("Live updates disabled: {error:#}"));
+                    terminal.draw_echo(&state)?;
+                    damage_watcher = None;
+                }
+            }
+        }
         let terminal_event = if let Some(pending) = pending_events.pop_front() {
             pending
         } else {
-            if let Some(timeout) = state.next_wakeup_timeout()
+            let timeout = state.next_wakeup_timeout().map_or_else(
+                || damage_watcher.as_ref().map(|_| DAMAGE_POLL_INTERVAL),
+                |timeout| {
+                    Some(if damage_watcher.is_some() {
+                        timeout.min(DAMAGE_POLL_INTERVAL)
+                    } else {
+                        timeout
+                    })
+                },
+            );
+            if let Some(timeout) = timeout
                 && (timeout.is_zero()
                     || !event::poll(timeout).context("cannot poll terminal events")?)
             {
                 let auto_refresh = state.take_due_auto_refresh();
-                state.expire_message();
+                let message_expired = state.expire_message();
                 if auto_refresh {
                     match capturer.capture() {
                         Ok(new_frame) => {
@@ -83,7 +125,7 @@ pub fn run(
                             terminal.draw_echo(&state)?;
                         }
                     }
-                } else {
+                } else if message_expired {
                     terminal.draw_echo(&state)?;
                 }
                 continue;
@@ -377,13 +419,16 @@ impl ViewerState {
         .map(|deadline| deadline.saturating_duration_since(now))
     }
 
-    fn expire_message(&mut self) {
+    fn expire_message(&mut self) -> bool {
         if self
             .message
             .as_ref()
             .is_some_and(|message| message.expires_at <= Instant::now())
         {
             self.message = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -998,6 +1043,35 @@ fn validate_output_geometry(frame: &RgbImage, output: &OutputGeometry) -> Result
     Ok(())
 }
 
+fn damage_affects_viewport(
+    damage: &[crate::screencopy::DamageRect],
+    viewport: ViewportRect,
+) -> bool {
+    damage.is_empty()
+        || damage.iter().any(|rect| {
+            rect.x < viewport.x.saturating_add(viewport.width)
+                && viewport.x < rect.x.saturating_add(rect.width)
+                && rect.y < viewport.y.saturating_add(viewport.height)
+                && viewport.y < rect.y.saturating_add(rect.height)
+        })
+}
+
+fn visible_region_changed(old: &RgbImage, new: &RgbImage, viewport: ViewportRect) -> bool {
+    if old.dimensions() != new.dimensions()
+        || viewport.x.saturating_add(viewport.width) > old.width()
+        || viewport.y.saturating_add(viewport.height) > old.height()
+    {
+        return true;
+    }
+    let row_bytes = viewport.width as usize * 3;
+    let image_row_bytes = old.width() as usize * 3;
+    let x = viewport.x as usize * 3;
+    (viewport.y..viewport.y + viewport.height).any(|y| {
+        let start = y as usize * image_row_bytes + x;
+        old.as_raw()[start..start + row_bytes] != new.as_raw()[start..start + row_bytes]
+    })
+}
+
 fn fit_status(status: &str, width: usize) -> String {
     let mut fitted = status.chars().take(width).collect::<String>();
     let current = fitted.chars().count();
@@ -1023,6 +1097,50 @@ mod tests {
         state.handle_key(key(KeyCode::Char('0')));
         assert_eq!(state.viewport.zoom, 1.0);
         assert_eq!(state.viewport.center_x, 0.5);
+    }
+
+    #[test]
+    fn ignores_damage_outside_the_visible_viewport() {
+        let viewport = ViewportRect {
+            x: 100,
+            y: 100,
+            width: 50,
+            height: 50,
+        };
+        assert!(!damage_affects_viewport(
+            &[crate::screencopy::DamageRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 20,
+            }],
+            viewport,
+        ));
+        assert!(damage_affects_viewport(
+            &[crate::screencopy::DamageRect {
+                x: 125,
+                y: 125,
+                width: 20,
+                height: 20,
+            }],
+            viewport,
+        ));
+    }
+
+    #[test]
+    fn compares_only_pixels_inside_the_visible_viewport() {
+        let old = RgbImage::new(4, 2);
+        let mut new = old.clone();
+        new.put_pixel(0, 0, image::Rgb([1, 2, 3]));
+        let viewport = ViewportRect {
+            x: 2,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        assert!(!visible_region_changed(&old, &new, viewport));
+        new.put_pixel(3, 1, image::Rgb([4, 5, 6]));
+        assert!(visible_region_changed(&old, &new, viewport));
     }
 
     #[test]

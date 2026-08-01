@@ -74,8 +74,9 @@ niri 官方建议复杂程序直接连接 `$NIRI_SOCKET`。JSON IPC 有兼容性
 - 无需每帧创建子进程。
 
 当前实现持有一个长期 Wayland connection，并复用 memfd-backed `wl_shm` buffer。首版绑定
-向后兼容的协议 v1，以保证 compositor 提供 SHM buffer 描述；升级到 v3
-`copy_with_damage` 和连续帧调度是下一阶段工作。
+向后兼容的协议 v1 完成验证后，已升级到 v3：等待 `buffer_done` 完成格式枚举，并在独立
+后台连接上运行 `copy_with_damage`。连续结果通过单槽 latest-frame 状态交给终端主线程，
+避免慢 SSH 链路积压帧；立即刷新使用另一条 `copy` 路径，保留确定的响应时间。
 
 窗口捕获初期采用“聚焦窗口后捕获其所在 output + viewport/zoom”。验证表明 niri 26.04 尚未提供 grim `-T` 所需的 `ext-image-copy-capture`，且 IPC 中窗口位置字段允许为空，因此不能可靠地直接捕获或按绝对坐标裁切窗口。当前实现使用与窗口坐标无关的 output viewport；未来 compositor 支持相应协议后再增加单窗口 backend。
 

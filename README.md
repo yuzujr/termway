@@ -59,6 +59,11 @@ termway 优先通过持久 Wayland 连接直接使用 `wlr-screencopy`，并在�
 `wl_shm` buffer，不再为每次刷新启动截图进程。compositor 不支持该协议或原生捕获失败时，
 会自动回退到 `grim`；`capture` 命令的 stderr 会显示实际 backend。
 
+viewer 在原生 backend 上额外运行最高 5 FPS 的 damage watcher。桌面静止时 compositor
+不会产生新帧；damage 发生在当前 viewport 之外，或可见像素实际没有变化时，也不会向
+SSH 终端发送重复 ANSI 帧。手动刷新、点击后刷新仍使用立即完成的 capture，不会被
+`copy_with_damage` 的等待语义阻塞。
+
 交互查看器默认从 1× 全景打开：
 
 ```console

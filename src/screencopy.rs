@@ -23,6 +23,19 @@ pub struct ScreencopySession {
     output: wl_output::WlOutput,
 }
 
+pub struct CapturedFrame {
+    pub image: RgbImage,
+    pub damage: Vec<DamageRect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Default)]
 struct CaptureState {
     outputs: Vec<Output>,
@@ -49,6 +62,17 @@ struct ShmBuffer {
 struct FrameState {
     status: FrameStatus,
     y_invert: bool,
+    descriptor: Option<BufferDescriptor>,
+    copy_with_damage: bool,
+    damage: Vec<DamageRect>,
+}
+
+#[derive(Clone, Copy)]
+struct BufferDescriptor {
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: wl_shm::Format,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -74,10 +98,8 @@ impl ScreencopySession {
             .context("cannot read Wayland globals")?;
         let qh = queue.handle();
 
-        // Version 1 guarantees a wl_shm buffer description. Newer compositors remain
-        // backwards compatible, while dmabuf negotiation can be added independently.
         let manager: ZwlrScreencopyManagerV1 = globals
-            .bind(&qh, 1..=1, ())
+            .bind(&qh, 1..=3, ())
             .context("compositor does not support wlr-screencopy")?;
         let shm: wl_shm::WlShm = globals
             .bind(&qh, 1..=1, ())
@@ -119,7 +141,25 @@ impl ScreencopySession {
     }
 
     pub fn capture(&mut self) -> Result<RgbImage> {
-        self.state.frame = FrameState::default();
+        Ok(self.capture_frame(false)?.image)
+    }
+
+    pub fn capture_with_damage(&mut self) -> Result<CapturedFrame> {
+        if self.manager.version() < 2 {
+            bail!("compositor does not support wlr-screencopy damage tracking");
+        }
+        self.capture_frame(true)
+    }
+
+    pub fn supports_damage(&self) -> bool {
+        self.manager.version() >= 2
+    }
+
+    fn capture_frame(&mut self, copy_with_damage: bool) -> Result<CapturedFrame> {
+        self.state.frame = FrameState {
+            copy_with_damage,
+            ..FrameState::default()
+        };
         let qh = self.queue.handle();
         let frame = self.manager.capture_output(0, &self.output, &qh, ());
         self.connection
@@ -153,14 +193,23 @@ impl ScreencopySession {
             .file
             .read_exact_at(&mut bytes, 0)
             .context("cannot read screencopy shared memory")?;
-        pixels_to_rgb(
+        let image = pixels_to_rgb(
             &bytes,
             buffer.width,
             buffer.height,
             buffer.stride,
             buffer.format,
             self.state.frame.y_invert,
-        )
+        )?;
+        let mut damage = std::mem::take(&mut self.state.frame.damage);
+        if self.state.frame.y_invert {
+            for rect in &mut damage {
+                rect.y = buffer
+                    .height
+                    .saturating_sub(rect.y.saturating_add(rect.height));
+            }
+        }
+        Ok(CapturedFrame { image, damage })
     }
 }
 
@@ -204,12 +253,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureState {
                     state.frame.status = FrameStatus::Failed;
                     return;
                 };
-                if ensure_buffer(state, qh, width, height, stride, format).is_err() {
-                    state.frame.status = FrameStatus::Failed;
-                    return;
+                state.frame.descriptor = Some(BufferDescriptor {
+                    width,
+                    height,
+                    stride,
+                    format,
+                });
+                if frame.version() < 3 {
+                    begin_copy(state, frame, qh);
                 }
-                frame.copy(&state.buffer.as_ref().expect("buffer was created").proxy);
-                state.frame.status = FrameStatus::WaitingForReady;
+            }
+            zwlr_screencopy_frame_v1::Event::BufferDone => {
+                begin_copy(state, frame, qh);
             }
             zwlr_screencopy_frame_v1::Event::Flags {
                 flags: WEnum::Value(flags),
@@ -222,9 +277,53 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureState {
             zwlr_screencopy_frame_v1::Event::Failed => {
                 state.frame.status = FrameStatus::Failed;
             }
+            zwlr_screencopy_frame_v1::Event::Damage {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state.frame.damage.push(DamageRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
             _ => {}
         }
     }
+}
+
+fn begin_copy(
+    state: &mut CaptureState,
+    frame: &ZwlrScreencopyFrameV1,
+    qh: &QueueHandle<CaptureState>,
+) {
+    let Some(descriptor) = state.frame.descriptor else {
+        state.frame.status = FrameStatus::Failed;
+        return;
+    };
+    if ensure_buffer(
+        state,
+        qh,
+        descriptor.width,
+        descriptor.height,
+        descriptor.stride,
+        descriptor.format,
+    )
+    .is_err()
+    {
+        state.frame.status = FrameStatus::Failed;
+        return;
+    }
+    let buffer = &state.buffer.as_ref().expect("buffer was created").proxy;
+    if state.frame.copy_with_damage {
+        frame.copy_with_damage(buffer);
+    } else {
+        frame.copy(buffer);
+    }
+    state.frame.status = FrameStatus::WaitingForReady;
 }
 
 fn ensure_buffer(
