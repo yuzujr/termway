@@ -84,6 +84,10 @@ cell 都携带完整的 tile 行列坐标，内置完整 297 项 diacritic 表�
 modeline 会在 crop 阶段显示 `GFX:KITTY/PREVIEW`，refine 后显示实际档位（例如
 `GFX:KITTY/720p`）；ANSI 则显示 `GFX:ANSI`。
 
+1× 全景发生 damage 后，变化先走 tile diff；画面静止 2 秒会生成一次新的高质量 atlas
+keyframe 并回收 tile generations。这样后续 click-to-focus 使用的是当前桌面，而不是启动时
+的旧截图，同时视频/动画期间不会反复发送完整 atlas。
+
 Kitty raster 在 PNG 前丢弃每个 sRGB channel 的最低 1 bit，单通道最大误差仅 1/255，视觉上
 等同原图，同时抑制截图低位噪声。固定 1080p 桌面样例的完整 PNG 从 1,347,696 bytes 降到
 1,106,338 bytes（约减少 18%），编码也从 8.8ms 降到 6.6ms；tile diff 同样受益。

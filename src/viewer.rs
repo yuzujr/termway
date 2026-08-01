@@ -50,6 +50,7 @@ const KITTY_REFINE_DELAY: Duration = Duration::from_millis(120);
 const KITTY_QUALITY_HEIGHTS: &[u32] = &[1080, 900, 720, 540, 360];
 const KITTY_FRAME_BUDGET: Duration = Duration::from_millis(275);
 const KITTY_QUALITY_RECOVERY_DELAY: Duration = Duration::from_secs(2);
+const KITTY_ATLAS_REFRESH_DELAY: Duration = Duration::from_secs(2);
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 // Keep tmux's eager pane reader from building a multi-megabyte client backlog. This is below a
 // 50 Mbit/s relay while remaining fast enough to deliver a typical UI frame in well under a
@@ -1215,6 +1216,8 @@ struct Terminal {
     kitty_quality: KittyQuality,
     kitty_frame_budget_bytes: usize,
     kitty_quality_upgrade_at: Option<Instant>,
+    kitty_atlas_refresh_at: Option<Instant>,
+    kitty_atlas_stale: bool,
     kitty_previewing: bool,
     force_kitty_redraw: bool,
     deferred_kitty_redraw: bool,
@@ -1276,6 +1279,8 @@ impl Terminal {
             kitty_frame_budget_bytes: (tmux_bandwidth_mbps * 1_000_000.0 / 8.0
                 * KITTY_FRAME_BUDGET.as_secs_f64()) as usize,
             kitty_quality_upgrade_at: None,
+            kitty_atlas_refresh_at: None,
+            kitty_atlas_stale: false,
             kitty_previewing: false,
             force_kitty_redraw: false,
             deferred_kitty_redraw: false,
@@ -1336,9 +1341,13 @@ impl Terminal {
     fn next_wakeup_timeout(&self) -> Option<Duration> {
         let now = Instant::now();
         earliest_timeout(
-            self.kitty_refine_at
-                .map(|deadline| deadline.saturating_duration_since(now)),
-            self.kitty_quality_upgrade_at
+            earliest_timeout(
+                self.kitty_refine_at
+                    .map(|deadline| deadline.saturating_duration_since(now)),
+                self.kitty_quality_upgrade_at
+                    .map(|deadline| deadline.saturating_duration_since(now)),
+            ),
+            self.kitty_atlas_refresh_at
                 .map(|deadline| deadline.saturating_duration_since(now)),
         )
     }
@@ -1349,6 +1358,15 @@ impl Terminal {
         if refine_due {
             self.kitty_refine_at = None;
         }
+        let atlas_due = self
+            .kitty_atlas_refresh_at
+            .is_some_and(|deadline| now >= deadline);
+        if atlas_due {
+            self.kitty_atlas_refresh_at = None;
+            self.kitty_quality_upgrade_at = None;
+            self.kitty_quality.reset();
+            self.force_kitty_redraw = true;
+        }
         let upgrade_due = self
             .kitty_quality_upgrade_at
             .is_some_and(|deadline| now >= deadline);
@@ -1358,10 +1376,14 @@ impl Terminal {
                 self.kitty_quality_upgrade_at = Some(now + KITTY_QUALITY_RECOVERY_DELAY);
             }
         }
-        refine_due || upgrade_due
+        refine_due || upgrade_due || atlas_due
     }
 
     fn note_visible_damage(&mut self) {
+        self.kitty_atlas_stale = true;
+        if self.kitty_layout.is_some_and(DrawLayout::is_full_viewport) {
+            self.kitty_atlas_refresh_at = Some(Instant::now() + KITTY_ATLAS_REFRESH_DELAY);
+        }
         if !self.kitty_quality.is_maximum() {
             self.kitty_quality_upgrade_at = Some(Instant::now() + KITTY_QUALITY_RECOVERY_DELAY);
         }
@@ -1465,6 +1487,9 @@ impl Terminal {
             source_width: frame.width(),
             source_height: frame.height(),
         };
+        if !layout.is_full_viewport() {
+            self.kitty_atlas_refresh_at = None;
+        }
 
         let atlas_compatible = self.kitty_atlas.as_ref().is_some_and(|atlas| {
             atlas.source_width == frame.width()
@@ -1532,6 +1557,8 @@ impl Terminal {
                 cell_height,
             });
             self.kitty_atlas_ready = false;
+            self.kitty_atlas_stale = false;
+            self.kitty_atlas_refresh_at = None;
             self.kitty_layout = Some(layout);
             self.kitty_refine_at = (!full_viewport).then(|| Instant::now() + KITTY_REFINE_DELAY);
             self.kitty_previewing = !full_viewport;
@@ -1679,6 +1706,9 @@ impl Terminal {
         self.kitty_layout = Some(layout);
         self.kitty_refine_at = None;
         self.kitty_previewing = false;
+        if self.kitty_atlas_stale && layout.is_full_viewport() {
+            self.kitty_atlas_refresh_at = Some(Instant::now() + KITTY_ATLAS_REFRESH_DELAY);
+        }
         self.force_kitty_redraw = false;
         self.deferred_kitty_redraw = false;
         self.draw_chrome(output_name, state, layout)?;
@@ -1975,6 +2005,18 @@ struct DrawLayout {
     source_height: u32,
 }
 
+impl DrawLayout {
+    fn is_full_viewport(self) -> bool {
+        self.viewport
+            == (ViewportRect {
+                x: 0,
+                y: 0,
+                width: self.source_width,
+                height: self.source_height,
+            })
+    }
+}
+
 struct KittyImageCache {
     layout: DrawLayout,
     image: RgbImage,
@@ -2015,6 +2057,10 @@ impl KittyQuality {
 
     fn is_maximum(&self) -> bool {
         self.tier == 0
+    }
+
+    fn reset(&mut self) {
+        self.tier = 0;
     }
 
     fn reduce_for(&mut self, encoded_bytes: usize, frame_budget_bytes: usize) -> bool {
