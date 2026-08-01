@@ -50,6 +50,16 @@ termway 在 SSH 登录后的远端主机上运行。它从 PTY 读取按键和�
 
 Sixel 可以以后作为第三个 renderer，不进入 MVP 的完成条件。
 
+### 为什么 50 Mbit/s 不能等同 Sunshine/Moonlight
+
+Kitty direct transport 只接收 RGB/RGBA、PNG，或 zlib 压缩后的像素；它不解码 H.264/H.265。
+[Waytermirror](https://github.com/cyber-wojtek/waytermirror) 的 pixel renderer 看起来也输出
+Kitty，但网络层实际是服务器 H.265 编码、已安装的本地 client 解码，再由 client 写入终端。
+Sunshine/Moonlight 同样依赖跨帧视频编码和本地解码。termway 的硬约束是 macOS 零安装，
+所以不能把视频码流直接交给 Kitty，只能在 SSH PTY 中发送独立图像/变化区域；这是同样带宽
+下帧率差异的根本来源。当前选择 terminal-side crop cache、damage tile、低位噪声抑制和
+动态空间分辨率，优先保证桌面操作延迟与静止文字清晰度。
+
 ## niri 集成
 
 niri 官方建议复杂程序直接连接 `$NIRI_SOCKET`。JSON IPC 有兼容性承诺，而 Rust `niri-ipc` crate 跟随 niri 自身版本，不遵循独立稳定 semver。因此采用：
