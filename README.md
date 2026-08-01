@@ -62,8 +62,7 @@ termway 优先通过持久 Wayland 连接直接使用 `wlr-screencopy`，并在�
 viewer 在原生 backend 上额外运行最高 5 FPS 的 damage watcher。桌面静止时 compositor
 不会产生新帧；damage 发生在当前 viewport 之外时也不会重绘。同一 viewport 下会比较
 新旧终端 cell，只发送变化的连续 cell 区间；完全相同的 cell buffer 不产生图像输出。
-后台 watcher 只保留最新帧，慢速渲染期间到达的旧帧会被覆盖。缩放、平移和终端 resize
-等布局变化仍完整重绘一次。手动刷新使用立即完成的 capture，不会被
+后台 watcher 只保留最新帧，慢速渲染期间到达的旧帧会被覆盖。手动刷新使用立即完成的 capture，不会被
 `copy_with_damage` 的等待语义阻塞。
 
 viewer 默认使用 `--graphics auto`。如果直连终端或 tmux 的实际 client 是 Kitty、WezTerm
@@ -73,8 +72,10 @@ viewer 默认使用 `--graphics auto`。如果直连终端或 tmux 的实际 cli
 cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使用双缓冲 image ID 完整
 替换发生变化的 tile，新 tile 显示后才回收旧 tile，不使用 Kitty animation frame patch。
 整帧会先归一到 terminal cell 的精确宽高比，避免各 tile 独立缩放产生接缝；每个 tile 使用
-完整协议单元无空窗替换，布局或缩放变化时才重建整个 tile grid。tmux 下使用
-Unicode placeholders；每个 placeholder cell 都携带完整的 tile 行列坐标，不依赖 tmux
+完整协议单元无空窗替换。首次显示会在 terminal 内缓存一张全屏 navigation atlas；缩放和
+平移立即通过 Kitty 的 source crop 重新 placement，不重新缩放、编码或传输像素，输入停止
+120ms 后再用高分辨率 tile 覆盖预览。tmux 下使用 Unicode placeholders；每个 placeholder
+cell 都携带完整的 tile 行列坐标，内置完整 297 项 diacritic 表以支持宽 pane，不依赖 tmux
 局部重绘时无法保证的左邻 cell 推导。因此图片位置和 pane 坐标由 tmux 正常管理。
 modeline 会显示 `GFX:KITTY` 或 `GFX:ANSI`。
 

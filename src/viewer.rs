@@ -45,6 +45,7 @@ const DAMAGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const KITTY_MAX_WIDTH: u32 = 1920;
 const KITTY_MAX_HEIGHT: u32 = 1080;
 const KITTY_TILE_SIZE: u32 = 128;
+const KITTY_REFINE_DELAY: Duration = Duration::from_millis(120);
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 pub struct RunOptions<'a> {
@@ -146,7 +147,9 @@ pub fn run(
         let terminal_event = if let Some(pending) = pending_events.pop_front() {
             pending
         } else {
-            let timeout = state.next_wakeup_timeout().map_or_else(
+            let timeout =
+                earliest_timeout(state.next_wakeup_timeout(), terminal.next_wakeup_timeout());
+            let timeout = timeout.map_or_else(
                 || damage_watcher.as_ref().map(|_| DAMAGE_POLL_INTERVAL),
                 |timeout| {
                     Some(if damage_watcher.is_some() {
@@ -169,9 +172,12 @@ pub fn run(
             if let Some(timeout) = timeout
                 && !event::poll(timeout).context("cannot poll terminal events")?
             {
+                let refine = terminal.take_due_refine();
                 let auto_refresh = state.take_due_auto_refresh();
                 let message_expired = state.expire_message();
-                if auto_refresh {
+                if refine {
+                    layout = terminal.draw(&frame, output_name, &state)?;
+                } else if auto_refresh {
                     match capturer.capture() {
                         Ok(new_frame) => {
                             frame = new_frame;
@@ -365,6 +371,14 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+fn earliest_timeout(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
+        (None, None) => None,
+    }
 }
 
 #[derive(Debug)]
@@ -1053,6 +1067,11 @@ impl OutputPump {
             .extend(segments.into_iter().filter(|segment| !segment.is_empty()));
     }
 
+    fn replace_graphics(&mut self, segments: Vec<Vec<u8>>) {
+        self.graphics.clear();
+        self.enqueue_graphics(segments);
+    }
+
     fn has_pending(&self) -> bool {
         self.active.is_some() || !self.control.is_empty() || !self.graphics.is_empty()
     }
@@ -1125,6 +1144,10 @@ struct Terminal {
     fallback_reason: Option<String>,
     last_image: Option<ImageCache>,
     last_kitty_image: Option<KittyImageCache>,
+    kitty_atlas: Option<KittyAtlasCache>,
+    kitty_atlas_ready: bool,
+    kitty_layout: Option<DrawLayout>,
+    kitty_refine_at: Option<Instant>,
     force_kitty_redraw: bool,
     deferred_kitty_redraw: bool,
     last_mode_line: Option<(u16, String, bool)>,
@@ -1170,6 +1193,10 @@ impl Terminal {
             fallback_reason,
             last_image: None,
             last_kitty_image: None,
+            kitty_atlas: None,
+            kitty_atlas_ready: false,
+            kitty_layout: None,
+            kitty_refine_at: None,
             force_kitty_redraw: false,
             deferred_kitty_redraw: false,
             last_mode_line: None,
@@ -1192,11 +1219,16 @@ impl Terminal {
     fn invalidate_image(&mut self) {
         self.last_image = None;
         self.force_kitty_redraw = true;
+        self.kitty_refine_at = None;
     }
 
     fn pump_output(&mut self) -> Result<bool> {
         if let Some(output) = &mut self.output_pump {
-            return output.pump(&self.stdout);
+            let progress = output.pump(&self.stdout)?;
+            if !output.graphics_busy() && self.kitty_atlas.is_some() {
+                self.kitty_atlas_ready = true;
+            }
+            return Ok(progress);
         }
         Ok(false)
     }
@@ -1215,6 +1247,23 @@ impl Terminal {
                 .is_none_or(|output| !output.graphics_busy())
         {
             self.deferred_kitty_redraw = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn next_wakeup_timeout(&self) -> Option<Duration> {
+        self.kitty_refine_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn take_due_refine(&mut self) -> bool {
+        if self
+            .kitty_refine_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.kitty_refine_at = None;
             true
         } else {
             false
@@ -1286,20 +1335,6 @@ impl Terminal {
         max_rows: u16,
         terminal_rows: u16,
     ) -> Result<DrawLayout> {
-        if self
-            .output_pump
-            .as_ref()
-            .is_some_and(OutputPump::graphics_busy)
-        {
-            self.deferred_kitty_redraw = true;
-            let layout = self
-                .last_kitty_image
-                .as_ref()
-                .expect("a queued Kitty frame has a cache")
-                .layout;
-            self.draw_chrome(output_name, state, layout)?;
-            return Ok(layout);
-        }
         let window = crossterm::terminal::window_size().ok();
         let cell_width = window
             .as_ref()
@@ -1313,17 +1348,11 @@ impl Terminal {
         let cell_height = cell_height.max(1);
         let display_pixel_width = u32::from(max_cols) * cell_width;
         let display_pixel_height = u32::from(max_rows) * cell_height;
-        let mut raster = render::render_raster_viewport(
-            frame,
-            display_pixel_width.min(KITTY_MAX_WIDTH),
-            display_pixel_height.min(KITTY_MAX_HEIGHT),
-            state.viewport,
-        )?;
-        // The transmitted raster may be capped to protect the SSH link, but its placement and
-        // pointer geometry must still fill the terminal's full aspect-fitted rectangle.
+        render::validate_viewport(state.viewport)?;
+        let viewport = render::viewport_rect(frame.width(), frame.height(), state.viewport);
         let (display_width, display_height) = render::fit_dimensions(
-            raster.viewport.width,
-            raster.viewport.height,
+            viewport.width,
+            viewport.height,
             display_pixel_width,
             display_pixel_height,
         );
@@ -1335,10 +1364,144 @@ impl Terminal {
             cols: cols.max(1),
             rows: rows.max(1),
             sample_height: rows.max(1).saturating_mul(2),
-            viewport: raster.viewport,
+            viewport,
             source_width: frame.width(),
             source_height: frame.height(),
         };
+
+        let atlas_compatible = self.kitty_atlas.as_ref().is_some_and(|atlas| {
+            atlas.source_width == frame.width()
+                && atlas.source_height == frame.height()
+                && atlas.max_cols == max_cols
+                && atlas.max_rows == max_rows
+                && atlas.cell_width == cell_width
+                && atlas.cell_height == cell_height
+        });
+        let rebuild_atlas = self.force_kitty_redraw
+            || !atlas_compatible
+            || !self.kitty.as_ref().is_some_and(kitty::Renderer::has_atlas);
+        if rebuild_atlas {
+            let mut atlas = render::render_raster_viewport(
+                frame,
+                display_pixel_width.min(KITTY_MAX_WIDTH),
+                display_pixel_height.min(KITTY_MAX_HEIGHT),
+                Viewport::default(),
+            )?;
+            atlas.image = render::align_raster_to_cell_grid(
+                &atlas.image,
+                layout.cols,
+                layout.rows,
+                cell_width,
+                cell_height,
+                KITTY_MAX_WIDTH,
+                KITTY_MAX_HEIGHT,
+            );
+            let crop = render::map_viewport_to_raster(
+                layout.viewport,
+                frame.width(),
+                frame.height(),
+                atlas.image.width(),
+                atlas.image.height(),
+            );
+            let segments = self
+                .kitty
+                .as_mut()
+                .expect("Kitty renderer was selected")
+                .encode_atlas(&atlas.image, crop, layout.cols, layout.rows)?;
+            self.output_pump
+                .as_mut()
+                .expect("Kitty output pump was initialized")
+                .replace_graphics(segments);
+            let full_viewport = layout.viewport
+                == (ViewportRect {
+                    x: 0,
+                    y: 0,
+                    width: frame.width(),
+                    height: frame.height(),
+                });
+            self.last_kitty_image = full_viewport.then(|| KittyImageCache {
+                layout,
+                image: atlas.image.clone(),
+            });
+            self.kitty_atlas = Some(KittyAtlasCache {
+                source_width: frame.width(),
+                source_height: frame.height(),
+                image_width: atlas.image.width(),
+                image_height: atlas.image.height(),
+                max_cols,
+                max_rows,
+                cell_width,
+                cell_height,
+            });
+            self.kitty_atlas_ready = false;
+            self.kitty_layout = Some(layout);
+            self.kitty_refine_at = (!full_viewport).then(|| Instant::now() + KITTY_REFINE_DELAY);
+            self.force_kitty_redraw = false;
+            self.deferred_kitty_redraw = false;
+            self.last_image = None;
+            self.draw_chrome(output_name, state, layout)?;
+            return Ok(layout);
+        }
+
+        let viewport_changed = self.kitty_layout != Some(layout);
+        if viewport_changed {
+            if self.kitty_atlas_ready {
+                let atlas = self
+                    .kitty_atlas
+                    .as_ref()
+                    .expect("a ready Kitty atlas has metadata");
+                let crop = render::map_viewport_to_raster(
+                    layout.viewport,
+                    atlas.source_width,
+                    atlas.source_height,
+                    atlas.image_width,
+                    atlas.image_height,
+                );
+                let segments = self
+                    .kitty
+                    .as_mut()
+                    .expect("Kitty renderer was selected")
+                    .encode_atlas_placement(crop, layout.cols, layout.rows)?;
+                self.output_pump
+                    .as_mut()
+                    .expect("Kitty output pump was initialized")
+                    .replace_graphics(segments);
+                self.last_kitty_image = None;
+                self.kitty_layout = Some(layout);
+                self.kitty_refine_at = Some(Instant::now() + KITTY_REFINE_DELAY);
+                self.deferred_kitty_redraw = false;
+            } else {
+                // An atlas placement is only valid once its complete upload reached Kitty.
+                self.deferred_kitty_redraw = true;
+            }
+            self.draw_chrome(output_name, state, layout)?;
+            return Ok(layout);
+        }
+
+        if self
+            .kitty_refine_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            self.draw_chrome(output_name, state, layout)?;
+            return Ok(layout);
+        }
+        if self
+            .output_pump
+            .as_ref()
+            .is_some_and(OutputPump::graphics_busy)
+        {
+            self.deferred_kitty_redraw = true;
+            self.draw_chrome(output_name, state, layout)?;
+            return Ok(layout);
+        }
+
+        let mut raster = render::render_raster_viewport(
+            frame,
+            display_pixel_width.min(KITTY_MAX_WIDTH),
+            display_pixel_height.min(KITTY_MAX_HEIGHT),
+            state.viewport,
+        )?;
+        debug_assert_eq!(raster.viewport, layout.viewport);
         raster.image = render::align_raster_to_cell_grid(
             &raster.image,
             layout.cols,
@@ -1388,6 +1551,8 @@ impl Terminal {
             layout,
             image: raster.image,
         });
+        self.kitty_layout = Some(layout);
+        self.kitty_refine_at = None;
         self.force_kitty_redraw = false;
         self.deferred_kitty_redraw = false;
         self.draw_chrome(output_name, state, layout)?;
@@ -1679,6 +1844,17 @@ struct DrawLayout {
 struct KittyImageCache {
     layout: DrawLayout,
     image: RgbImage,
+}
+
+struct KittyAtlasCache {
+    source_width: u32,
+    source_height: u32,
+    image_width: u32,
+    image_height: u32,
+    max_cols: u16,
+    max_rows: u16,
+    cell_width: u32,
+    cell_height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

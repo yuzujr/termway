@@ -284,7 +284,7 @@ pub fn validate_viewport(viewport: Viewport) -> Result<()> {
     Ok(())
 }
 
-fn viewport_rect(width: u32, height: u32, viewport: Viewport) -> ViewportRect {
+pub fn viewport_rect(width: u32, height: u32, viewport: Viewport) -> ViewportRect {
     let crop_width = ((width as f32 / viewport.zoom).round() as u32).clamp(1, width);
     let crop_height = ((height as f32 / viewport.zoom).round() as u32).clamp(1, height);
     let center_x = viewport.center_x * width as f32;
@@ -300,6 +300,33 @@ fn viewport_rect(width: u32, height: u32, viewport: Viewport) -> ViewportRect {
         y,
         width: crop_width,
         height: crop_height,
+    }
+}
+
+/// Map a source-image viewport to the corresponding pixel crop in a downscaled raster. Outward
+/// rounding guarantees that even a one-pixel source viewport remains visible.
+pub fn map_viewport_to_raster(
+    viewport: ViewportRect,
+    source_width: u32,
+    source_height: u32,
+    raster_width: u32,
+    raster_height: u32,
+) -> ViewportRect {
+    assert!(source_width > 0 && source_height > 0);
+    assert!(raster_width > 0 && raster_height > 0);
+    let x = u64::from(viewport.x) * u64::from(raster_width) / u64::from(source_width);
+    let y = u64::from(viewport.y) * u64::from(raster_height) / u64::from(source_height);
+    let right = (u64::from(viewport.x + viewport.width) * u64::from(raster_width))
+        .div_ceil(u64::from(source_width));
+    let bottom = (u64::from(viewport.y + viewport.height) * u64::from(raster_height))
+        .div_ceil(u64::from(source_height));
+    let x = (x as u32).min(raster_width - 1);
+    let y = (y as u32).min(raster_height - 1);
+    ViewportRect {
+        x,
+        y,
+        width: (right as u32).min(raster_width).saturating_sub(x).max(1),
+        height: (bottom as u32).min(raster_height).saturating_sub(y).max(1),
     }
 }
 
@@ -468,6 +495,30 @@ mod tests {
                 y: 450,
                 width: 250,
                 height: 150,
+            }
+        );
+    }
+
+    #[test]
+    fn maps_source_viewport_to_downscaled_raster_with_outward_rounding() {
+        assert_eq!(
+            map_viewport_to_raster(
+                ViewportRect {
+                    x: 251,
+                    y: 101,
+                    width: 499,
+                    height: 299,
+                },
+                1000,
+                600,
+                400,
+                240,
+            ),
+            ViewportRect {
+                x: 100,
+                y: 40,
+                width: 200,
+                height: 120,
             }
         );
     }
