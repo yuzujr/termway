@@ -1,6 +1,5 @@
 use std::io::{self, Stdout, Write};
 use std::path::Path;
-use std::thread;
 use std::time::{Duration, Instant};
 use std::{collections::VecDeque, mem};
 
@@ -160,7 +159,8 @@ pub fn run(
                     Effect::SendKey(encoded) => {
                         if let Some(keyboard) = &keyboard {
                             match keyboard.key(encoded.keycode, encoded.modifiers) {
-                                Ok(()) => state.schedule_auto_refresh(),
+                                Ok(()) if damage_watcher.is_none() => state.schedule_auto_refresh(),
+                                Ok(()) => {}
                                 Err(error) => {
                                     state.error(format!("Key injection failed: {error:#}"));
                                     terminal.draw_echo(&state)?;
@@ -171,7 +171,8 @@ pub fn run(
                     Effect::SendUnicode(character) => {
                         if let Some(keyboard) = &mut keyboard {
                             match keyboard.unicode(character) {
-                                Ok(()) => state.schedule_auto_refresh(),
+                                Ok(()) if damage_watcher.is_none() => state.schedule_auto_refresh(),
+                                Ok(()) => {}
                                 Err(error) => {
                                     state.error(format!("Unicode injection failed: {error:#}"));
                                     terminal.draw_echo(&state)?;
@@ -209,10 +210,12 @@ pub fn run(
                                         point.global_x,
                                         point.global_y
                                     ));
-                                    thread::sleep(Duration::from_millis(75));
-                                    if let Ok(new_frame) = capturer.capture() {
-                                        frame = new_frame;
-                                        frame_changed = true;
+                                    if damage_watcher.is_none() {
+                                        std::thread::sleep(Duration::from_millis(75));
+                                        if let Ok(new_frame) = capturer.capture() {
+                                            frame = new_frame;
+                                            frame_changed = true;
+                                        }
                                     }
                                 }
                                 Err(error) => {

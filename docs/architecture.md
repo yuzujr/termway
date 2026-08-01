@@ -43,7 +43,8 @@ src/
 
 显示目标 output 或 viewport。当前版本通过持久的 wlr-screencopy Wayland 连接捕获完整
 output，并跨帧复用 `wl_shm` buffer；协议不可用时回退到 grim。zoom、pan 和 pane resize
-只进行本地重绘，按 `r` 手动重新捕获，键盘输入停止后也会 debounce 自动刷新。连续模式
+只进行本地重绘，按 `r` 手动重新捕获。原生 damage watcher 可用时，点击和键盘输入不再
+额外捕获；grim 回退路径才会使用点击刷新和键盘 debounce。连续模式
 使用独立 Wayland 连接执行 `copy_with_damage`，最高 5 FPS；主线程只轮询一个覆盖旧值的
 latest-frame 槽，因此 SSH 输出慢时不会积压帧。手动 capture 仍走独立的立即返回路径，
 不会在静止画面上等待 damage。

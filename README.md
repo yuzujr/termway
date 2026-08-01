@@ -61,7 +61,7 @@ termway 优先通过持久 Wayland 连接直接使用 `wlr-screencopy`，并在�
 
 viewer 在原生 backend 上额外运行最高 5 FPS 的 damage watcher。桌面静止时 compositor
 不会产生新帧；damage 发生在当前 viewport 之外，或可见像素实际没有变化时，也不会向
-SSH 终端发送重复 ANSI 帧。手动刷新、点击后刷新仍使用立即完成的 capture，不会被
+SSH 终端发送重复 ANSI 帧。手动刷新仍使用立即完成的 capture，不会被
 `copy_with_damage` 的等待语义阻塞。
 
 交互查看器默认从 1× 全景打开：
@@ -121,8 +121,10 @@ termway 会将这个字节统一解释为前缀；支持增强键盘协议的终
 ASCII、方向/navigation、F1–F12 以及 Shift、Control、Alt、Super 使用 US evdev keymap。
 非 ASCII 字符使用独立的动态 XKB keymap，将终端收到的 Unicode code point 直接发送给
 远端应用，不依赖远端输入法。
-成功发送键盘输入后会启动 250ms debounce；期间有新按键就重新计时，输入停止后自动
-捕获并重绘一帧。显式 `Ctrl-\ r` 会取消尚未触发的自动刷新，避免重复捕获。
+原生 damage watcher 可用时，键盘输入和点击产生的画面变化由 compositor 自动报告，
+不会额外发起前台 capture。回退到 grim 或 watcher 运行失败时，键盘输入会启用 250ms
+debounce，点击后也会主动捕获，维持相同的基本交互能力。显式 `Ctrl-\ r` 始终强制立即
+捕获当前画面，作为手动刷新和恢复手段。
 
 底部采用 Emacs 式两层信息区：mode line 持续显示当前模式、输出、倍率和 viewport；
 echo area 显示刷新结果、点击坐标和错误。普通消息 2 秒后自动清空，错误保留 5 秒，
