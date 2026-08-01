@@ -43,6 +43,18 @@ enum Command {
         /// Override the image height in terminal rows.
         #[arg(long)]
         rows: Option<u16>,
+
+        /// Magnify the captured output around the selected center point.
+        #[arg(short, long, default_value_t = 1.0)]
+        zoom: f32,
+
+        /// Horizontal viewport center from 0.0 (left) to 1.0 (right).
+        #[arg(long, default_value_t = 0.5)]
+        center_x: f32,
+
+        /// Vertical viewport center from 0.0 (top) to 1.0 (bottom).
+        #[arg(long, default_value_t = 0.5)]
+        center_y: f32,
     },
 }
 
@@ -53,7 +65,14 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Doctor) {
         Command::Doctor => doctor(discovered),
         Command::Events { count } => events(discovered.socket_path, count),
-        Command::Capture { output, cols, rows } => capture(discovered, output, cols, rows),
+        Command::Capture {
+            output,
+            cols,
+            rows,
+            zoom,
+            center_x,
+            center_y,
+        } => capture(discovered, output, cols, rows, zoom, center_x, center_y),
     }
 }
 
@@ -62,6 +81,9 @@ fn capture(
     output: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    zoom: f32,
+    center_x: f32,
+    center_y: f32,
 ) -> Result<()> {
     let display = discovered
         .wayland_display
@@ -89,16 +111,30 @@ fn capture(
     let capture_elapsed = started.elapsed();
 
     let started = std::time::Instant::now();
-    let rendered = render::render_half_blocks(&frame, cols, rows);
+    let rendered = render::render_half_blocks_viewport(
+        &frame,
+        cols,
+        rows,
+        render::Viewport {
+            zoom,
+            center_x,
+            center_y,
+        },
+    )?;
     let render_elapsed = started.elapsed();
 
     io::stdout().write_all(&rendered.bytes)?;
     io::stdout().flush()?;
     eprintln!(
-        "termway: output={output}, capture={}x{} in {:.1?}, render={}x{} cells/{} bytes in {:.1?}",
+        "termway: output={output}, capture={}x{} in {:.1?}, viewport={}x{}+{},{} zoom={:.2}x, render={}x{} cells/{} bytes in {:.1?}",
         frame.width(),
         frame.height(),
         capture_elapsed,
+        rendered.viewport.width,
+        rendered.viewport.height,
+        rendered.viewport.x,
+        rendered.viewport.y,
+        zoom,
         rendered.cols,
         rendered.rows,
         rendered.bytes.len(),

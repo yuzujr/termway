@@ -47,6 +47,10 @@ nix develop --command cargo run --release -- capture
 
 # 固定输出尺寸，便于测试或重定向
 nix develop --command cargo run --release -- capture --cols 120 --rows 36
+
+# 放大屏幕中央；移动中心点以查看其他区域
+nix develop --command cargo run --release -- capture --zoom 3
+nix develop --command cargo run --release -- capture --zoom 3 --center-x 0.25 --center-y 0.4
 ```
 
 图像 escape sequence 写入 stdout，捕获耗时、渲染耗时和字节数写入 stderr。图像路径请使用 release build；debug build 的缩放性能不具有代表性。

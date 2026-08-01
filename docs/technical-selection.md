@@ -73,7 +73,7 @@ niri 官方建议复杂程序直接连接 `$NIRI_SOCKET`。JSON IPC 有兼容性
 - 可利用 damage 信息减少无变化帧输出；
 - 无需每帧创建子进程。
 
-窗口捕获初期采用“聚焦窗口后捕获其所在 output + viewport/zoom”。不要假设 niri IPC 一定提供足够可靠的窗口物理像素边界；单窗口裁切需要单独验证协议与坐标信息。
+窗口捕获初期采用“聚焦窗口后捕获其所在 output + viewport/zoom”。验证表明 niri 26.04 尚未提供 grim `-T` 所需的 `ext-image-copy-capture`，且 IPC 中窗口位置字段允许为空，因此不能可靠地直接捕获或按绝对坐标裁切窗口。当前实现使用与窗口坐标无关的 output viewport；未来 compositor 支持相应协议后再增加单窗口 backend。
 
 ## 输入路径
 

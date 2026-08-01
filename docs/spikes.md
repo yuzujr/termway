@@ -35,6 +35,7 @@
 - 使用 triangle filter 等比缩放；
 - 每个 `▀` 字符以前景色承载上像素、背景色承载下像素；
 - 自动读取终端尺寸，也支持 `--cols`/`--rows`；
+- 支持 `--zoom` 与归一化的 `--center-x`/`--center-y` viewport；
 - 图像与 metrics 分别写入 stdout/stderr。
 
 2026-08-01 在当前 eDP-1（2560×1600、scale 1.25）上的 release 实测：
@@ -44,7 +45,9 @@
 - 单帧 ANSI 约 170 KB；
 - 80×24 tmux pane 中实际图像宽 73 cells，没有横向换行。
 
-剩余工作：用 CC Switch 实际验证局部文字可读性。连续刷新和 damage tracking 属于 Spike 4。
+单独捕获 focused window 的路径也做了验证。niri 的 IPC window ID 与 foreign-toplevel identifier 可以对应，但当前 niri 26.04 没有实现 grim `-T` 所需的 `ext-image-copy-capture` 窗口捕获协议。因此当前版本使用 output viewport zoom，不依赖不稳定的窗口绝对坐标。未来 compositor 支持该协议时可以重新启用单窗口捕获。
+
+剩余工作：用 CC Switch 实际验证 2×–4× zoom 后的局部文字可读性。连续刷新和 damage tracking 属于 Spike 4。
 
 ## Spike 2：终端输入
 

@@ -1,21 +1,69 @@
+use anyhow::{Result, bail};
 use image::imageops::FilterType;
 use image::{Rgb, RgbImage};
+
+#[derive(Debug, Clone, Copy)]
+pub struct Viewport {
+    pub zoom: f32,
+    pub center_x: f32,
+    pub center_y: f32,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            center_x: 0.5,
+            center_y: 0.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewportRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
 
 pub struct RenderedFrame {
     pub bytes: Vec<u8>,
     pub cols: u16,
     pub rows: u16,
+    pub viewport: ViewportRect,
 }
 
+#[cfg(test)]
 pub fn render_half_blocks(source: &RgbImage, max_cols: u16, max_rows: u16) -> RenderedFrame {
+    render_half_blocks_viewport(source, max_cols, max_rows, Viewport::default())
+        .expect("the default viewport is valid")
+}
+
+pub fn render_half_blocks_viewport(
+    source: &RgbImage,
+    max_cols: u16,
+    max_rows: u16,
+    viewport: Viewport,
+) -> Result<RenderedFrame> {
+    validate_viewport(viewport)?;
+    let viewport = viewport_rect(source.width(), source.height(), viewport);
+    let cropped = image::imageops::crop_imm(
+        source,
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height,
+    )
+    .to_image();
     let (sample_width, sample_height) = fitted_sample_size(
-        source.width(),
-        source.height(),
+        viewport.width,
+        viewport.height,
         max_cols.into(),
         u32::from(max_rows) * 2,
     );
     let resized =
-        image::imageops::resize(source, sample_width, sample_height, FilterType::Triangle);
+        image::imageops::resize(&cropped, sample_width, sample_height, FilterType::Triangle);
     let rows = sample_height.div_ceil(2);
     let mut bytes = Vec::with_capacity(sample_width as usize * rows as usize * 36);
 
@@ -33,10 +81,43 @@ pub fn render_half_blocks(source: &RgbImage, max_cols: u16, max_rows: u16) -> Re
     }
     bytes.extend_from_slice(b"\x1b[0m");
 
-    RenderedFrame {
+    Ok(RenderedFrame {
         bytes,
         cols: sample_width as u16,
         rows: rows as u16,
+        viewport,
+    })
+}
+
+fn validate_viewport(viewport: Viewport) -> Result<()> {
+    if !viewport.zoom.is_finite() || viewport.zoom < 1.0 {
+        bail!("zoom must be a finite number greater than or equal to 1.0");
+    }
+    if !viewport.center_x.is_finite() || !(0.0..=1.0).contains(&viewport.center_x) {
+        bail!("center-x must be between 0.0 and 1.0");
+    }
+    if !viewport.center_y.is_finite() || !(0.0..=1.0).contains(&viewport.center_y) {
+        bail!("center-y must be between 0.0 and 1.0");
+    }
+    Ok(())
+}
+
+fn viewport_rect(width: u32, height: u32, viewport: Viewport) -> ViewportRect {
+    let crop_width = ((width as f32 / viewport.zoom).round() as u32).clamp(1, width);
+    let crop_height = ((height as f32 / viewport.zoom).round() as u32).clamp(1, height);
+    let center_x = viewport.center_x * width as f32;
+    let center_y = viewport.center_y * height as f32;
+    let x = (center_x - crop_width as f32 / 2.0)
+        .round()
+        .clamp(0.0, (width - crop_width) as f32) as u32;
+    let y = (center_y - crop_height as f32 / 2.0)
+        .round()
+        .clamp(0.0, (height - crop_height) as f32) as u32;
+    ViewportRect {
+        x,
+        y,
+        width: crop_width,
+        height: crop_height,
     }
 }
 
@@ -87,6 +168,65 @@ mod tests {
         assert_eq!(
             String::from_utf8(rendered.bytes).unwrap(),
             "\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m▀\x1b[0m\r\n\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn zooms_around_center() {
+        assert_eq!(
+            viewport_rect(
+                1000,
+                600,
+                Viewport {
+                    zoom: 2.0,
+                    center_x: 0.5,
+                    center_y: 0.5,
+                }
+            ),
+            ViewportRect {
+                x: 250,
+                y: 150,
+                width: 500,
+                height: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn clamps_viewport_at_edges() {
+        assert_eq!(
+            viewport_rect(
+                1000,
+                600,
+                Viewport {
+                    zoom: 4.0,
+                    center_x: 0.0,
+                    center_y: 1.0,
+                }
+            ),
+            ViewportRect {
+                x: 0,
+                y: 450,
+                width: 250,
+                height: 150,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_viewport() {
+        let image = RgbImage::new(1, 1);
+        assert!(
+            render_half_blocks_viewport(
+                &image,
+                1,
+                1,
+                Viewport {
+                    zoom: 0.5,
+                    ..Viewport::default()
+                }
+            )
+            .is_err()
         );
     }
 }
