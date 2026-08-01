@@ -54,3 +54,19 @@ nix develop --command cargo run --release -- capture --zoom 3 --center-x 0.25 --
 ```
 
 图像 escape sequence 写入 stdout，捕获耗时、渲染耗时和字节数写入 stderr。图像路径请使用 release build；debug build 的缩放性能不具有代表性。
+
+交互查看器默认从 1× 全景打开：
+
+```console
+nix develop --command cargo run --release -- view
+```
+
+键位：
+
+- 方向键或 `hjkl`：平移 viewport；
+- `+`/`-`：逐级缩放；
+- `1`–`9`：直接切换倍率；
+- `0`：返回 1× 全景并居中；
+- `c`：保持倍率并回到中心；
+- `r`：重新捕获当前画面；
+- `q`、Esc、Ctrl-C、Ctrl-D：退出。

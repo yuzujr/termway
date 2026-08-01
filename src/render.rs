@@ -77,7 +77,7 @@ pub fn render_half_blocks_viewport(
             };
             push_cell(&mut bytes, top, bottom);
         }
-        bytes.extend_from_slice(b"\x1b[0m\r\n");
+        bytes.extend_from_slice(b"\x1b[0m\x1b[K\r\n");
     }
     bytes.extend_from_slice(b"\x1b[0m");
 
@@ -89,7 +89,7 @@ pub fn render_half_blocks_viewport(
     })
 }
 
-fn validate_viewport(viewport: Viewport) -> Result<()> {
+pub fn validate_viewport(viewport: Viewport) -> Result<()> {
     if !viewport.zoom.is_finite() || viewport.zoom < 1.0 {
         bail!("zoom must be a finite number greater than or equal to 1.0");
     }
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(rendered.rows, 1);
         assert_eq!(
             String::from_utf8(rendered.bytes).unwrap(),
-            "\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m▀\x1b[0m\r\n\x1b[0m"
+            "\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m▀\x1b[0m\x1b[K\r\n\x1b[0m"
         );
     }
 

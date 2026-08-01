@@ -2,6 +2,7 @@ mod capture;
 mod discovery;
 mod niri;
 mod render;
+mod viewer;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -56,6 +57,24 @@ enum Command {
         #[arg(long, default_value_t = 0.5)]
         center_y: f32,
     },
+    /// Interactively pan and zoom a captured output.
+    View {
+        /// View this output instead of niri's focused output.
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Initial magnification.
+        #[arg(short, long, default_value_t = 1.0)]
+        zoom: f32,
+
+        /// Initial horizontal center from 0.0 (left) to 1.0 (right).
+        #[arg(long, default_value_t = 0.5)]
+        center_x: f32,
+
+        /// Initial vertical center from 0.0 (top) to 1.0 (bottom).
+        #[arg(long, default_value_t = 0.5)]
+        center_y: f32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -73,7 +92,37 @@ fn main() -> Result<()> {
             center_x,
             center_y,
         } => capture(discovered, output, cols, rows, zoom, center_x, center_y),
+        Command::View {
+            output,
+            zoom,
+            center_x,
+            center_y,
+        } => view(discovered, output, zoom, center_x, center_y),
     }
+}
+
+fn view(
+    discovered: discovery::GraphicalSession,
+    output: Option<String>,
+    zoom: f32,
+    center_x: f32,
+    center_y: f32,
+) -> Result<()> {
+    let display = discovered
+        .wayland_display
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("could not discover WAYLAND_DISPLAY"))?;
+    let output = resolve_output(&discovered, output)?;
+    viewer::run(
+        &discovered.runtime_dir,
+        display,
+        &output,
+        render::Viewport {
+            zoom,
+            center_x,
+            center_y,
+        },
+    )
 }
 
 fn capture(
@@ -89,15 +138,7 @@ fn capture(
         .wayland_display
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("could not discover WAYLAND_DISPLAY"))?;
-    let output = match output {
-        Some(output) => output,
-        None => {
-            let mut client = niri::Client::connect(&discovered.socket_path)?;
-            client
-                .focused_output_name()?
-                .ok_or_else(|| anyhow::anyhow!("niri has no focused output; pass --output"))?
-        }
-    };
+    let output = resolve_output(&discovered, output)?;
 
     let terminal_size = crossterm::terminal::size().unwrap_or((100, 30));
     let cols = cols.unwrap_or(terminal_size.0).max(1);
@@ -141,6 +182,21 @@ fn capture(
         render_elapsed,
     );
     Ok(())
+}
+
+fn resolve_output(
+    discovered: &discovery::GraphicalSession,
+    output: Option<String>,
+) -> Result<String> {
+    match output {
+        Some(output) => Ok(output),
+        None => {
+            let mut client = niri::Client::connect(&discovered.socket_path)?;
+            client
+                .focused_output_name()?
+                .ok_or_else(|| anyhow::anyhow!("niri has no focused output; pass --output"))
+        }
+    }
 }
 
 fn doctor(discovered: discovery::GraphicalSession) -> Result<()> {

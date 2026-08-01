@@ -15,7 +15,7 @@
 
 实现会依次检查命令行覆盖、当前进程环境、systemd user environment 和 runtime directory。扫描得到多个活动 niri session 时拒绝猜测，要求显式传入 `--niri-socket`。
 
-## Spike 1：只看画面（单帧链路已实现）
+## Spike 1：只看画面（已完成）
 
 目标：`grim` 截图经缩放后，以 truecolor half-block 输出到当前 PTY。
 
@@ -37,6 +37,8 @@
 - 自动读取终端尺寸，也支持 `--cols`/`--rows`；
 - 支持 `--zoom` 与归一化的 `--center-x`/`--center-y` viewport；
 - 图像与 metrics 分别写入 stdout/stderr。
+- 提供 alternate-screen 交互 viewer，支持即时 zoom、pan、resize 和手动刷新；
+- 所有正常错误与退出路径均恢复 raw mode、光标和 line wrap。
 
 2026-08-01 在当前 eDP-1（2560×1600、scale 1.25）上的 release 实测：
 
@@ -47,7 +49,7 @@
 
 单独捕获 focused window 的路径也做了验证。niri 的 IPC window ID 与 foreign-toplevel identifier 可以对应，但当前 niri 26.04 没有实现 grim `-T` 所需的 `ext-image-copy-capture` 窗口捕获协议。因此当前版本使用 output viewport zoom，不依赖不稳定的窗口绝对坐标。未来 compositor 支持该协议时可以重新启用单窗口捕获。
 
-剩余工作：用 CC Switch 实际验证 2×–4× zoom 后的局部文字可读性。连续刷新和 damage tracking 属于 Spike 4。
+macOS SSH 实测确认：half-block 在 5× 以上配合合适 viewport 可以读清 CC Switch 文字。因此该 renderer 定位为不支持 Kitty Graphics 时的兼容回退：1× 用于全景定位，5×–9× 用于阅读和操作。连续刷新和 damage tracking 属于 Spike 4。
 
 ## Spike 2：终端输入
 
@@ -59,6 +61,8 @@
 - SGR mouse 的移动、按下、释放和滚轮；
 - tmux 内外行为一致；
 - SSH 中断后恢复终端模式和光标。
+
+进展：viewer 已覆盖普通字符、方向键、组合退出键和 resize，并通过真实 tmux send-keys 测试。bracketed paste、SGR mouse 和完整输入可视化仍待实现。
 
 ## Spike 3：家中侧输入注入
 

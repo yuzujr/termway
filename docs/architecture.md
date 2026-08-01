@@ -41,7 +41,17 @@ src/
 
 ### View mode
 
-显示目标 output 或 viewport。默认 5 FPS，只有 damage 或用户输入时才优先刷新；允许临时提高 FPS。
+显示目标 output 或 viewport。当前版本缓存一次完整 output 捕获，zoom、pan 和 pane resize 只进行本地重绘，按 `r` 手动重新捕获。连续模式完成后默认低帧率，并只在 damage 或用户输入时优先刷新。
+
+重绘采用以下策略：
+
+- 不在帧开始时清空屏幕，而是以新图直接覆盖旧图；
+- 每行完成后清理右侧残留，整张图完成后再清理下方残留；
+- 使用 DEC synchronized update（CSI 2026）请求终端原子提交一帧；
+- 边界按键和其他无状态变化的事件不触发绘制；
+- 整帧在内存中生成后才写入 stdout。
+
+不支持 synchronized update 的终端会忽略该序列，但仍能从“旧图直接被新图覆盖”获得比预清屏更好的退化体验。后续如果整帧带宽成为瓶颈，再引入 cell buffer diff，只发送发生变化的连续区段。
 
 ### Control mode
 
