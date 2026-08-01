@@ -85,3 +85,7 @@ control mode 启动时仍是 `CONTROL:OFF`。按 `i` 切换 armed/disarmed；只
 `CONTROL:ARMED` 状态下的左键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
 点击后会自动刷新一帧。该路径使用 Wayland 绝对坐标，不依赖 `ydotool`、`/dev/uinput`
 或鼠标加速度。当前输入映射仅支持 niri 的 `Normal` output transform。
+
+底部采用 Emacs 式两层信息区：mode line 持续显示当前模式、输出、倍率和 viewport；
+echo area 显示刷新结果、点击坐标和错误。普通消息 2 秒后自动清空，错误保留 5 秒，
+不会覆盖 mode line 中的控制状态。

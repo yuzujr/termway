@@ -1,7 +1,7 @@
 use std::io::{self, Stdout, Write};
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -26,6 +26,8 @@ const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 32.0;
 const ZOOM_STEP: f32 = 1.25;
 const PAN_VIEWPORT_FRACTION: f32 = 0.2;
+const MESSAGE_DURATION: Duration = Duration::from_secs(2);
+const ERROR_DURATION: Duration = Duration::from_secs(5);
 
 pub fn run(
     runtime_dir: &Path,
@@ -45,6 +47,14 @@ pub fn run(
     let mut layout = terminal.draw(&frame, output_name, &state)?;
 
     loop {
+        if let Some(timeout) = state.message_timeout()
+            && (timeout.is_zero()
+                || !event::poll(timeout).context("cannot poll terminal events")?)
+        {
+            state.expire_message();
+            layout = terminal.draw(&frame, output_name, &state)?;
+            continue;
+        }
         match event::read().context("cannot read a terminal event")? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 match state.handle_key(key) {
@@ -57,9 +67,9 @@ pub fn run(
                         ) {
                             Ok(new_frame) => {
                                 frame = new_frame;
-                                state.notice = Some("frame refreshed".into());
+                                state.message("Refreshed frame");
                             }
-                            Err(error) => state.notice = Some(format!("refresh failed: {error:#}")),
+                            Err(error) => state.error(format!("Refresh failed: {error:#}")),
                         }
                         layout = terminal.draw(&frame, output_name, &state)?;
                     }
@@ -78,7 +88,7 @@ pub fn run(
                                 output_geometry.height,
                             ) {
                                 Ok(()) => {
-                                    state.notice = Some(format!(
+                                    state.message(format!(
                                         "clicked {}:{} (global {},{})",
                                         point.local_x,
                                         point.local_y,
@@ -95,12 +105,12 @@ pub fn run(
                                     }
                                 }
                                 Err(error) => {
-                                    state.notice = Some(format!("click failed: {error:#}"));
+                                    state.error(format!("Click failed: {error:#}"));
                                 }
                             }
                         }
                     } else {
-                        state.notice = Some(format!(
+                        state.message(format!(
                             "preview {}:{} (global {},{}); {}",
                             point.local_x,
                             point.local_y,
@@ -126,9 +136,15 @@ pub fn run(
 #[derive(Debug)]
 struct ViewerState {
     viewport: Viewport,
-    notice: Option<String>,
+    message: Option<EchoMessage>,
     control: bool,
     armed: bool,
+}
+
+#[derive(Debug)]
+struct EchoMessage {
+    text: String,
+    expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +160,7 @@ impl ViewerState {
         render::validate_viewport(viewport)?;
         let mut state = Self {
             viewport,
-            notice: None,
+            message: None,
             control,
             armed: false,
         };
@@ -164,10 +180,10 @@ impl ViewerState {
             KeyCode::Char('r') => Effect::Refresh,
             KeyCode::Char('i') if self.control => {
                 self.armed = !self.armed;
-                self.notice = Some(if self.armed {
-                    "CONTROL ARMED: left click will control the desktop".into()
+                self.message(if self.armed {
+                    "CONTROL ARMED: left click will control the desktop"
                 } else {
-                    "control disarmed".into()
+                    "Control disarmed"
                 });
                 Effect::Redraw
             }
@@ -185,9 +201,40 @@ impl ViewerState {
             _ => Effect::None,
         };
         if effect == Effect::Redraw && !matches!(key.code, KeyCode::Char('i')) {
-            self.notice = None;
+            self.message = None;
         }
         effect
+    }
+
+    fn message(&mut self, text: impl Into<String>) {
+        self.message_for(text, MESSAGE_DURATION);
+    }
+
+    fn error(&mut self, text: impl Into<String>) {
+        self.message_for(text, ERROR_DURATION);
+    }
+
+    fn message_for(&mut self, text: impl Into<String>, duration: Duration) {
+        self.message = Some(EchoMessage {
+            text: text.into(),
+            expires_at: Instant::now() + duration,
+        });
+    }
+
+    fn message_timeout(&self) -> Option<Duration> {
+        self.message
+            .as_ref()
+            .map(|message| message.expires_at.saturating_duration_since(Instant::now()))
+    }
+
+    fn expire_message(&mut self) {
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|message| message.expires_at <= Instant::now())
+        {
+            self.message = None;
+        }
     }
 
     fn set_zoom(&mut self, zoom: f32) -> Effect {
@@ -274,36 +321,63 @@ impl Terminal {
         state: &ViewerState,
     ) -> Result<DrawLayout> {
         let (cols, rows) = crossterm::terminal::size()?;
-        let image_rows = rows.saturating_sub(1).max(1);
+        let image_rows = rows.saturating_sub(2).max(1);
         let rendered =
             render::render_half_blocks_viewport(frame, cols.max(1), image_rows, state.viewport)?;
-        let status_y = rendered.rows.min(rows.saturating_sub(1));
-        let status = state.notice.clone().unwrap_or_else(|| {
-            let mode = if !state.control {
-                "VIEW"
-            } else if state.armed {
-                "CONTROL:ARMED"
-            } else {
-                "CONTROL:OFF"
-            };
-            format!(
-                " {mode} | {output_name} | {:.2}x @ {:.0}%,{:.0}% | click inspect  i arm  arrows pan  +/- zoom  r refresh  q quit ",
+        let mode_y = rows.saturating_sub(2);
+        let echo_y = rows.saturating_sub(1);
+        let mode = if !state.control {
+            "VIEW"
+        } else if state.armed {
+            "CONTROL:ARMED"
+        } else {
+            "CONTROL:OFF"
+        };
+        let input_hint = if !state.control {
+            "click inspect"
+        } else if state.armed {
+            "i disarm"
+        } else {
+            "i arm"
+        };
+        let mode_line = fit_status(
+            &format!(
+                " - Termway: {output_name}  [{mode}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  r refresh  q quit ",
                 state.viewport.zoom,
                 state.viewport.center_x * 100.0,
                 state.viewport.center_y * 100.0,
-            )
-        });
-        let status = fit_status(&status, cols as usize);
+                rendered.cols,
+                rendered.rows,
+            ),
+            cols as usize,
+        );
+        let echo = fit_status(
+            state
+                .message
+                .as_ref()
+                .map(|message| message.text.as_str())
+                .unwrap_or(""),
+            cols as usize,
+        );
 
         self.stdout.sync_update(|stdout| -> io::Result<()> {
             stdout.queue(MoveTo(0, 0))?;
             stdout.write_all(&rendered.bytes)?;
             stdout.queue(Clear(ClearType::FromCursorDown))?;
-            stdout.queue(MoveTo(0, status_y))?;
-            stdout.queue(SetForegroundColor(Color::Black))?;
-            stdout.queue(SetBackgroundColor(Color::Grey))?;
-            stdout.queue(Print(status))?;
+            stdout.queue(MoveTo(0, mode_y))?;
+            if state.armed {
+                stdout.queue(SetForegroundColor(Color::White))?;
+                stdout.queue(SetBackgroundColor(Color::DarkRed))?;
+            } else {
+                stdout.queue(SetForegroundColor(Color::Black))?;
+                stdout.queue(SetBackgroundColor(Color::Grey))?;
+            }
+            stdout.queue(Print(mode_line))?;
             stdout.queue(ResetColor)?;
+            if rows > 1 {
+                stdout.queue(MoveTo(0, echo_y))?;
+                stdout.queue(Print(echo))?;
+            }
             Ok(())
         })??;
         Ok(DrawLayout {
@@ -495,6 +569,17 @@ mod tests {
         assert!(control.armed);
         assert_eq!(control.handle_key(key(KeyCode::Char('i'))), Effect::Redraw);
         assert!(!control.armed);
+    }
+
+    #[test]
+    fn echo_messages_expire_independently_from_mode_state() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        state.armed = true;
+        state.message_for("Clicked 1:2", Duration::ZERO);
+        state.expire_message();
+        assert!(state.message.is_none());
+        assert!(state.armed);
+        assert!(state.control);
     }
 
     #[test]
