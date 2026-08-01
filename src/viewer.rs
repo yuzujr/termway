@@ -9,7 +9,7 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
 use crossterm::terminal::{
     Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     disable_raw_mode, enable_raw_mode,
@@ -52,7 +52,7 @@ pub fn run(
                 || !event::poll(timeout).context("cannot poll terminal events")?)
         {
             state.expire_message();
-            layout = terminal.draw(&frame, output_name, &state)?;
+            terminal.draw_echo(&state)?;
             continue;
         }
         match event::read().context("cannot read a terminal event")? {
@@ -60,7 +60,7 @@ pub fn run(
                 match state.handle_key(key) {
                     Effect::Quit => break,
                     Effect::Refresh => {
-                        match capture::capture_with_grim(
+                        let refreshed = match capture::capture_with_grim(
                             runtime_dir,
                             wayland_display,
                             Some(output_name),
@@ -68,17 +68,31 @@ pub fn run(
                             Ok(new_frame) => {
                                 frame = new_frame;
                                 state.message("Refreshed frame");
+                                true
                             }
-                            Err(error) => state.error(format!("Refresh failed: {error:#}")),
+                            Err(error) => {
+                                state.error(format!("Refresh failed: {error:#}"));
+                                false
+                            }
+                        };
+                        if refreshed {
+                            layout = terminal.draw(&frame, output_name, &state)?;
+                        } else {
+                            terminal.draw_echo(&state)?;
                         }
-                        layout = terminal.draw(&frame, output_name, &state)?;
                     }
                     Effect::Redraw => layout = terminal.draw(&frame, output_name, &state)?,
+                    Effect::Chrome => terminal.draw_chrome(output_name, &state, layout)?,
                     Effect::None => {}
                 }
             }
             Event::Mouse(mouse) => {
+                if state.handle_mouse_navigation(mouse, layout) == Effect::Redraw {
+                    layout = terminal.draw(&frame, output_name, &state)?;
+                    continue;
+                }
                 if let Some(point) = map_left_click(mouse, layout, &output_geometry) {
+                    let mut frame_changed = false;
                     if state.control && state.armed {
                         if let Some(pointer) = &pointer {
                             match pointer.click(
@@ -102,6 +116,7 @@ pub fn run(
                                         Some(output_name),
                                     ) {
                                         frame = new_frame;
+                                        frame_changed = true;
                                     }
                                 }
                                 Err(error) => {
@@ -123,7 +138,11 @@ pub fn run(
                             }
                         ));
                     }
-                    layout = terminal.draw(&frame, output_name, &state)?;
+                    if frame_changed {
+                        layout = terminal.draw(&frame, output_name, &state)?;
+                    } else {
+                        terminal.draw_echo(&state)?;
+                    }
                 }
             }
             Event::Resize(_, _) => layout = terminal.draw(&frame, output_name, &state)?,
@@ -151,6 +170,7 @@ struct EchoMessage {
 enum Effect {
     None,
     Redraw,
+    Chrome,
     Refresh,
     Quit,
 }
@@ -185,7 +205,7 @@ impl ViewerState {
                 } else {
                     "Control disarmed"
                 });
-                Effect::Redraw
+                Effect::Chrome
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.set_zoom((self.viewport.zoom * ZOOM_STEP).min(MAX_ZOOM))
@@ -200,7 +220,7 @@ impl ViewerState {
             KeyCode::Down | KeyCode::Char('j') => self.pan(0.0, 1.0),
             _ => Effect::None,
         };
-        if effect == Effect::Redraw && !matches!(key.code, KeyCode::Char('i')) {
+        if effect == Effect::Redraw {
             self.message = None;
         }
         effect
@@ -291,10 +311,33 @@ impl ViewerState {
         self.viewport.center_x = self.viewport.center_x.clamp(margin, 1.0 - margin);
         self.viewport.center_y = self.viewport.center_y.clamp(margin, 1.0 - margin);
     }
+
+    fn handle_mouse_navigation(&mut self, mouse: MouseEvent, layout: DrawLayout) -> Effect {
+        if mouse.column >= layout.cols || mouse.row >= layout.rows {
+            return Effect::None;
+        }
+        let effect = match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.set_zoom((self.viewport.zoom * ZOOM_STEP).min(MAX_ZOOM))
+            }
+            MouseEventKind::ScrollDown => {
+                self.set_zoom((self.viewport.zoom / ZOOM_STEP).max(MIN_ZOOM))
+            }
+            MouseEventKind::ScrollLeft => self.pan(-1.0, 0.0),
+            MouseEventKind::ScrollRight => self.pan(1.0, 0.0),
+            _ => Effect::None,
+        };
+        if effect == Effect::Redraw {
+            self.message = None;
+        }
+        effect
+    }
 }
 
 struct Terminal {
     stdout: Stdout,
+    last_mode_line: Option<(u16, String, bool)>,
+    last_echo: Option<(u16, String)>,
 }
 
 impl Terminal {
@@ -311,7 +354,11 @@ impl Terminal {
             let _ = disable_raw_mode();
             return Err(error).context("cannot initialize the interactive terminal");
         }
-        Ok(Self { stdout })
+        Ok(Self {
+            stdout,
+            last_mode_line: None,
+            last_echo: None,
+        })
     }
 
     fn draw(
@@ -324,8 +371,46 @@ impl Terminal {
         let image_rows = rows.saturating_sub(2).max(1);
         let rendered =
             render::render_half_blocks_viewport(frame, cols.max(1), image_rows, state.viewport)?;
+        let layout = DrawLayout {
+            cols: rendered.cols,
+            rows: rendered.rows,
+            sample_height: rendered.sample_height,
+            viewport: rendered.viewport,
+            source_width: frame.width(),
+            source_height: frame.height(),
+        };
         let mode_y = rows.saturating_sub(2);
-        let echo_y = rows.saturating_sub(1);
+        self.stdout.sync_update(|stdout| -> io::Result<()> {
+            stdout.queue(MoveTo(0, 0))?;
+            stdout.write_all(&rendered.bytes)?;
+            for y in rendered.rows..mode_y {
+                stdout.queue(MoveTo(0, y))?;
+                stdout.queue(Clear(ClearType::CurrentLine))?;
+            }
+            Ok(())
+        })??;
+        self.draw_chrome(output_name, state, layout)?;
+        Ok(layout)
+    }
+
+    fn draw_chrome(
+        &mut self,
+        output_name: &str,
+        state: &ViewerState,
+        layout: DrawLayout,
+    ) -> Result<()> {
+        self.draw_mode_line(output_name, state, layout)?;
+        self.draw_echo(state)
+    }
+
+    fn draw_mode_line(
+        &mut self,
+        output_name: &str,
+        state: &ViewerState,
+        layout: DrawLayout,
+    ) -> Result<()> {
+        let (cols, rows) = crossterm::terminal::size()?;
+        let mode_y = rows.saturating_sub(2);
         let mode = if !state.control {
             "VIEW"
         } else if state.armed {
@@ -346,11 +431,37 @@ impl Terminal {
                 state.viewport.zoom,
                 state.viewport.center_x * 100.0,
                 state.viewport.center_y * 100.0,
-                rendered.cols,
-                rendered.rows,
+                layout.cols,
+                layout.rows,
             ),
             cols as usize,
         );
+        let signature = (mode_y, mode_line.clone(), state.armed);
+        if self.last_mode_line.as_ref() == Some(&signature) {
+            return Ok(());
+        }
+        self.stdout.sync_update(|stdout| -> io::Result<()> {
+            stdout.queue(MoveTo(0, mode_y))?;
+            stdout.queue(ResetColor)?;
+            stdout.queue(SetAttribute(Attribute::Reverse))?;
+            if state.armed {
+                stdout.queue(SetAttribute(Attribute::Bold))?;
+            }
+            stdout.queue(Print(mode_line))?;
+            stdout.queue(SetAttribute(Attribute::Reset))?;
+            stdout.queue(ResetColor)?;
+            Ok(())
+        })??;
+        self.last_mode_line = Some(signature);
+        Ok(())
+    }
+
+    fn draw_echo(&mut self, state: &ViewerState) -> Result<()> {
+        let (cols, rows) = crossterm::terminal::size()?;
+        if rows <= 1 {
+            return Ok(());
+        }
+        let echo_y = rows - 1;
         let echo = fit_status(
             state
                 .message
@@ -359,41 +470,26 @@ impl Terminal {
                 .unwrap_or(""),
             cols as usize,
         );
-
+        let signature = (echo_y, echo.clone());
+        if self.last_echo.as_ref() == Some(&signature) {
+            return Ok(());
+        }
         self.stdout.sync_update(|stdout| -> io::Result<()> {
-            stdout.queue(MoveTo(0, 0))?;
-            stdout.write_all(&rendered.bytes)?;
-            stdout.queue(Clear(ClearType::FromCursorDown))?;
-            stdout.queue(MoveTo(0, mode_y))?;
-            if state.armed {
-                stdout.queue(SetForegroundColor(Color::White))?;
-                stdout.queue(SetBackgroundColor(Color::DarkRed))?;
-            } else {
-                stdout.queue(SetForegroundColor(Color::Black))?;
-                stdout.queue(SetBackgroundColor(Color::Grey))?;
-            }
-            stdout.queue(Print(mode_line))?;
+            stdout.queue(MoveTo(0, echo_y))?;
+            stdout.queue(SetAttribute(Attribute::Reset))?;
             stdout.queue(ResetColor)?;
-            if rows > 1 {
-                stdout.queue(MoveTo(0, echo_y))?;
-                stdout.queue(Print(echo))?;
-            }
+            stdout.queue(Print(echo))?;
             Ok(())
         })??;
-        Ok(DrawLayout {
-            cols: rendered.cols,
-            rows: rendered.rows,
-            sample_height: rendered.sample_height,
-            viewport: rendered.viewport,
-            source_width: frame.width(),
-            source_height: frame.height(),
-        })
+        self.last_echo = Some(signature);
+        Ok(())
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = self.stdout.execute(EndSynchronizedUpdate);
+        let _ = self.stdout.execute(SetAttribute(Attribute::Reset));
         let _ = self.stdout.execute(ResetColor);
         let _ = self.stdout.execute(DisableMouseCapture);
         let _ = self.stdout.execute(crossterm::terminal::EnableLineWrap);
@@ -565,9 +661,9 @@ mod tests {
         assert!(!view_only.armed);
 
         let mut control = ViewerState::new(Viewport::default(), true).unwrap();
-        assert_eq!(control.handle_key(key(KeyCode::Char('i'))), Effect::Redraw);
+        assert_eq!(control.handle_key(key(KeyCode::Char('i'))), Effect::Chrome);
         assert!(control.armed);
-        assert_eq!(control.handle_key(key(KeyCode::Char('i'))), Effect::Redraw);
+        assert_eq!(control.handle_key(key(KeyCode::Char('i'))), Effect::Chrome);
         assert!(!control.armed);
     }
 
@@ -662,6 +758,44 @@ mod tests {
         assert!(map_left_click(mouse(0, 20), layout, &output).is_none());
         output.transform = "90".into();
         assert!(map_left_click(mouse(0, 0), layout, &output).is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_zooms_and_horizontal_scroll_pans_inside_image() {
+        let layout = DrawLayout {
+            cols: 80,
+            rows: 20,
+            sample_height: 40,
+            viewport: ViewportRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 400,
+            },
+            source_width: 800,
+            source_height: 400,
+        };
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut state = ViewerState::new(Viewport::default(), false).unwrap();
+        assert_eq!(
+            state.handle_mouse_navigation(mouse(MouseEventKind::ScrollUp, 40, 10), layout),
+            Effect::Redraw
+        );
+        assert_eq!(state.viewport.zoom, 1.25);
+        assert_eq!(
+            state.handle_mouse_navigation(mouse(MouseEventKind::ScrollRight, 40, 10), layout),
+            Effect::Redraw
+        );
+        assert!(state.viewport.center_x > 0.5);
+        assert_eq!(
+            state.handle_mouse_navigation(mouse(MouseEventKind::ScrollUp, 80, 10), layout),
+            Effect::None
+        );
     }
 
     #[test]
