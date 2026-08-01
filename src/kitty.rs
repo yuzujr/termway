@@ -226,6 +226,7 @@ impl Renderer {
         let mut output = Vec::new();
         let mut stale_tiles = reset.then(|| std::mem::take(&mut self.active_tiles));
         for tile in tiles {
+            let mut transaction = Vec::new();
             if tile.index > MAX_TILE_INDEX {
                 bail!("Kitty tile index {} exceeds {MAX_TILE_INDEX}", tile.index);
             }
@@ -255,15 +256,25 @@ impl Renderer {
             } else {
                 first_id
             };
-            push_upload(&mut output, self.transport, image_id, &tile.image)?;
-            push_placement(&mut output, self.transport, image_id, tile, previous_id);
+            push_upload(&mut transaction, self.transport, image_id, &tile.image)?;
+            push_placement(
+                &mut transaction,
+                self.transport,
+                image_id,
+                tile,
+                previous_id,
+            );
             // Never expose the background between versions. The new image/placeholder is fully
             // installed before the previous image and its placement are reclaimed.
             if self.transport == Transport::Tmux
                 && let Some(previous_id) = previous_id
             {
-                push_delete_image(&mut output, self.transport, previous_id);
+                push_delete_image(&mut transaction, self.transport, previous_id);
             }
+            // Kitty requires every chunk of an image upload to finish before another graphics
+            // command. Treat one tile upload + placement as an indivisible queue unit so a newer
+            // navigation preview can safely discard later tiles without stranding m=1 uploads.
+            output.push(transaction.into_iter().flatten().collect());
             self.active_tiles.insert(tile.index, image_id);
         }
         if let Some(stale_tiles) = stale_tiles {
@@ -638,6 +649,39 @@ mod tests {
         let delete = second.find("a=d,d=I,i=7,q=2").unwrap();
         assert!(transmit < placement && placement < delete);
         assert!(!second.contains("a=f"));
+    }
+
+    #[test]
+    fn each_tiled_upload_is_one_cancellable_protocol_transaction() {
+        let mut renderer = Renderer {
+            transport: Transport::Direct,
+            image_id_base: 7,
+            active_tiles: BTreeMap::new(),
+            active_atlas: None,
+            atlas_dimensions: None,
+        };
+        let image = RgbImage::from_fn(128, 128, |x, y| {
+            let value = x.wrapping_mul(1_664_525) ^ y.wrapping_mul(1_013_904_223);
+            image::Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+        });
+        let segments = renderer
+            .encode_tiles(
+                &[RasterTile {
+                    image,
+                    index: 0,
+                    col: 0,
+                    row: 0,
+                    cols: 16,
+                    rows: 8,
+                }],
+                false,
+            )
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        let encoded = String::from_utf8_lossy(&segments[0]);
+        assert!(encoded.matches("m=1").count() > 1);
+        assert!(encoded.ends_with("\x1b\\"));
+        assert!(encoded.contains("a=p,i=7"));
     }
 
     #[test]
