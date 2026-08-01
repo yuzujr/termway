@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{collections::VecDeque, mem};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
@@ -48,18 +48,18 @@ const KITTY_TILE_SIZE: u32 = 128;
 const KITTY_COLOR_BITS: u8 = 7;
 const KITTY_REFINE_DELAY: Duration = Duration::from_millis(120);
 const KITTY_QUALITY_HEIGHTS: &[u32] = &[1080, 900, 720, 540, 360];
-const KITTY_FRAME_BUDGET_BYTES: usize = 1_100_000;
+const KITTY_FRAME_BUDGET: Duration = Duration::from_millis(275);
 const KITTY_QUALITY_RECOVERY_DELAY: Duration = Duration::from_secs(2);
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 // Keep tmux's eager pane reader from building a multi-megabyte client backlog. This is below a
 // 50 Mbit/s relay while remaining fast enough to deliver a typical UI frame in well under a
 // second. Direct SSH already gets real backpressure from its channel and is left unrestricted.
-const TMUX_GRAPHICS_BYTES_PER_SECOND: f64 = 4.0 * 1024.0 * 1024.0;
 const TMUX_GRAPHICS_BURST_BYTES: f64 = 16.0 * 1024.0;
 
 pub struct RunOptions<'a> {
     pub control: bool,
     pub graphics: GraphicsMode,
+    pub tmux_bandwidth_mbps: f64,
     pub initial_viewport: Viewport,
     pub actions: Vec<Action>,
     pub niri_socket: &'a Path,
@@ -120,7 +120,7 @@ pub fn run(
         .control
         .then(|| VirtualKeyboard::connect(runtime_dir, wayland_display))
         .transpose()?;
-    let mut terminal = Terminal::enter(options.graphics)?;
+    let mut terminal = Terminal::enter(options.graphics, options.tmux_bandwidth_mbps)?;
     state.graphics_backend = terminal.backend_name();
     if let Some(reason) = terminal.take_fallback_reason() {
         state.message(format!("Using ANSI graphics: {reason}"));
@@ -1055,7 +1055,7 @@ struct OutputPump {
 }
 
 impl OutputPump {
-    fn new(stdout: &Stdout, pace_graphics: bool) -> Result<Self> {
+    fn new(stdout: &Stdout, graphics_bytes_per_second: Option<f64>) -> Result<Self> {
         let original_flags = fcntl_getfl(stdout).context("cannot read stdout flags")?;
         fcntl_setfl(stdout, original_flags | OFlags::NONBLOCK)
             .context("cannot enable non-blocking stdout")?;
@@ -1064,12 +1064,8 @@ impl OutputPump {
             active: None,
             control: VecDeque::new(),
             graphics: VecDeque::new(),
-            graphics_limiter: pace_graphics.then(|| {
-                RateLimiter::new(
-                    TMUX_GRAPHICS_BYTES_PER_SECOND,
-                    TMUX_GRAPHICS_BURST_BYTES,
-                    Instant::now(),
-                )
+            graphics_limiter: graphics_bytes_per_second.map(|bytes_per_second| {
+                RateLimiter::new(bytes_per_second, TMUX_GRAPHICS_BURST_BYTES, Instant::now())
             }),
         })
     }
@@ -1217,6 +1213,7 @@ struct Terminal {
     kitty_layout: Option<DrawLayout>,
     kitty_refine_at: Option<Instant>,
     kitty_quality: KittyQuality,
+    kitty_frame_budget_bytes: usize,
     kitty_quality_upgrade_at: Option<Instant>,
     kitty_previewing: bool,
     force_kitty_redraw: bool,
@@ -1226,7 +1223,10 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn enter(graphics: GraphicsMode) -> Result<Self> {
+    fn enter(graphics: GraphicsMode, tmux_bandwidth_mbps: f64) -> Result<Self> {
+        if !tmux_bandwidth_mbps.is_finite() || tmux_bandwidth_mbps <= 0.0 {
+            bail!("--tmux-bandwidth-mbps must be a positive finite number");
+        }
         let (kitty, fallback_reason) = match kitty::Selection::select(graphics)? {
             kitty::Selection::Ansi { reason } => (None, reason),
             kitty::Selection::Kitty(renderer) => (Some(renderer), None),
@@ -1245,8 +1245,11 @@ impl Terminal {
             return Err(error).context("cannot initialize the interactive terminal");
         }
         let output_pump = if kitty.is_some() {
-            let pace_graphics = kitty.as_ref().is_some_and(kitty::Renderer::is_tmux);
-            match OutputPump::new(&stdout, pace_graphics) {
+            let graphics_rate = kitty
+                .as_ref()
+                .filter(|renderer| renderer.is_tmux())
+                .map(|_| tmux_bandwidth_mbps * 1_000_000.0 / 8.0);
+            match OutputPump::new(&stdout, graphics_rate) {
                 Ok(output) => Some(output),
                 Err(error) => {
                     let _ = stdout.execute(Show);
@@ -1270,6 +1273,8 @@ impl Terminal {
             kitty_layout: None,
             kitty_refine_at: None,
             kitty_quality: KittyQuality::default(),
+            kitty_frame_budget_bytes: (tmux_bandwidth_mbps * 1_000_000.0 / 8.0
+                * KITTY_FRAME_BUDGET.as_secs_f64()) as usize,
             kitty_quality_upgrade_at: None,
             kitty_previewing: false,
             force_kitty_redraw: false,
@@ -1637,8 +1642,10 @@ impl Terminal {
             let segments = candidate.encode_tiles(&tiles, reset)?;
             let encoded_bytes = segments.iter().map(Vec::len).sum();
             if candidate.is_tmux()
-                && encoded_bytes > KITTY_FRAME_BUDGET_BYTES
-                && self.kitty_quality.reduce_for(encoded_bytes)
+                && encoded_bytes > self.kitty_frame_budget_bytes
+                && self
+                    .kitty_quality
+                    .reduce_for(encoded_bytes, self.kitty_frame_budget_bytes)
             {
                 quality_reduced = true;
                 continue;
@@ -2010,14 +2017,14 @@ impl KittyQuality {
         self.tier == 0
     }
 
-    fn reduce_for(&mut self, encoded_bytes: usize) -> bool {
+    fn reduce_for(&mut self, encoded_bytes: usize, frame_budget_bytes: usize) -> bool {
         let initial = self.tier;
         while self.tier + 1 < KITTY_QUALITY_HEIGHTS.len() {
             let current = KITTY_QUALITY_HEIGHTS[initial] as u64;
             let candidate = KITTY_QUALITY_HEIGHTS[self.tier + 1] as u64;
             let projected = encoded_bytes as u64 * candidate * candidate / (current * current);
             self.tier += 1;
-            if projected <= KITTY_FRAME_BUDGET_BYTES as u64 {
+            if projected <= frame_budget_bytes as u64 {
                 break;
             }
         }
@@ -2802,13 +2809,13 @@ mod tests {
     fn kitty_quality_jumps_to_a_frame_budget_and_recovers_gradually() {
         let mut quality = KittyQuality::default();
         assert_eq!(quality.limits(), (1920, 1080));
-        assert!(quality.reduce_for(6_000_000));
+        assert!(quality.reduce_for(6_000_000, 1_100_000));
         assert_eq!(quality.label(), "360p");
         assert!(quality.upgrade());
         assert_eq!(quality.label(), "540p");
 
         let mut moderate = KittyQuality::default();
-        assert!(moderate.reduce_for(1_500_000));
+        assert!(moderate.reduce_for(1_500_000, 1_100_000));
         assert_eq!(moderate.label(), "900p");
     }
 }

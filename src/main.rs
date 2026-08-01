@@ -91,6 +91,10 @@ enum Command {
         /// Select terminal image rendering, probing known terminal environments in auto mode.
         #[arg(long, value_enum, default_value_t = kitty::GraphicsMode::Auto)]
         graphics: kitty::GraphicsMode,
+
+        /// Pace Kitty image output inside tmux to this relay bandwidth.
+        #[arg(long, default_value_t = 40.0, value_name = "MBPS")]
+        tmux_bandwidth_mbps: f64,
     },
 }
 
@@ -117,6 +121,7 @@ fn main() -> Result<()> {
             center_y,
             control,
             graphics,
+            tmux_bandwidth_mbps,
         } => view(
             discovered,
             ViewOptions {
@@ -128,6 +133,7 @@ fn main() -> Result<()> {
                 },
                 control,
                 graphics,
+                tmux_bandwidth_mbps,
                 actions: config.actions,
             },
         ),
@@ -139,6 +145,7 @@ struct ViewOptions {
     viewport: render::Viewport,
     control: bool,
     graphics: kitty::GraphicsMode,
+    tmux_bandwidth_mbps: f64,
     actions: Vec<config::Action>,
 }
 
@@ -157,6 +164,7 @@ fn view(discovered: discovery::GraphicalSession, options: ViewOptions) -> Result
         viewer::RunOptions {
             control: options.control,
             graphics: options.graphics,
+            tmux_bandwidth_mbps: options.tmux_bandwidth_mbps,
             initial_viewport: options.viewport,
             actions: options.actions,
             niri_socket: &discovered.socket_path,

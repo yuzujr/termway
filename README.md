@@ -86,7 +86,8 @@ Kitty raster 在 PNG 前丢弃每个 sRGB channel 的最低 1 bit，单通道最
 等同原图，同时抑制截图低位噪声。固定 1080p 桌面样例的完整 PNG 从 1,347,696 bytes 降到
 1,106,338 bytes（约减少 18%），编码也从 8.8ms 降到 6.6ms；tile diff 同样受益。
 
-tmux 下的 refined frame 以约 1.1 MB 为单帧传输预算。如果视频或大面积动画令无损 PNG
+tmux 下的 refined frame 以约 275ms 为单帧传输预算；默认 40 Mbit/s 时约为 1.38 MB。
+如果视频或大面积动画令无损 PNG
 超过预算，会按编码后的实际大小直接降到 900p/720p/540p/360p 中合适的一档，而不是先把
 超大帧塞进 tmux；modeline 显示当前档位。画面静止 2 秒后逐档恢复，避免动画期间反复抖动，
 同时让停止后的文字自动回到最高精度。navigation atlas 始终保留清晰的 1080p 全局预览。
@@ -97,8 +98,15 @@ placement 作为不可拆分事务，满足协议“不在 `m=1` 上传中插入
 发送时不会继续堆积 damage 帧，只记录一次最新画面重绘请求。modeline、echo 和输入状态输出
 优先于后续图像事务，退出时最多补完当前协议事务，随后
 丢弃尚未发送的图像，避免低速 tmux/SSH 链路阻塞控制。tmux 会主动吸收 pane PTY 输出、无法
-把真实 client 背压传回程序，因此 termway 在 tmux 下把图像输出平滑限制在约 32 Mbit/s、只
-允许 16 KiB burst；控制输出不受此限制，避免它排在 tmux 已缓存的数 MB 图像之后。
+把真实 client 背压传回程序，因此 termway 在 tmux 下默认把图像输出平滑限制在 40 Mbit/s、
+只允许 16 KiB burst；控制输出不受此限制，避免它排在 tmux 已缓存的数 MB 图像之后。可按
+实测 SSH 路径调整，例如 50 Mbit/s 链路保守使用：
+
+```console
+termway view --graphics kitty --tmux-bandwidth-mbps 40
+```
+
+更快的中转可以提高该值，画质预算会随之同步增加；直连 Kitty 不使用这个限速参数。
 
 可以显式选择或排错：
 
