@@ -47,6 +47,9 @@ const GRAPHICAL_ENVIRONMENT_KEYS: &[&str] = &[
     "XDG_CURRENT_DESKTOP",
     "XDG_SESSION_DESKTOP",
     "XDG_SESSION_TYPE",
+    // GUI launchers such as Kitty use this to choose the interactive shell. Prefer the local
+    // graphical session's value over a possibly stale SSH/tmux environment.
+    "SHELL",
 ];
 
 pub fn discover(override_socket: Option<&Path>) -> Result<GraphicalSession> {
@@ -292,6 +295,7 @@ mod tests {
     fn graphical_environment_prefers_local_systemd_session() {
         let process = HashMap::from([
             (OsString::from("DISPLAY"), OsString::from("localhost:10.0")),
+            (OsString::from("SHELL"), OsString::from("/bin/bash")),
             (
                 OsString::from("DBUS_SESSION_BUS_ADDRESS"),
                 OsString::from("ssh-bus"),
@@ -299,6 +303,10 @@ mod tests {
         ]);
         let systemd = HashMap::from([
             (OsString::from("DISPLAY"), OsString::from(":0")),
+            (
+                OsString::from("SHELL"),
+                OsString::from("/run/current-system/sw/bin/fish"),
+            ),
             (
                 OsString::from("DBUS_SESSION_BUS_ADDRESS"),
                 OsString::from("local-bus"),
@@ -319,6 +327,10 @@ mod tests {
         assert_eq!(
             environment.get(OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
             Some(&OsString::from("local-bus"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("SHELL")),
+            Some(&OsString::from("/run/current-system/sw/bin/fish"))
         );
         assert!(!environment.contains_key(OsStr::new("UNRELATED_SECRET")));
     }

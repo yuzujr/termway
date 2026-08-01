@@ -66,6 +66,36 @@ viewer 在原生 backend 上额外运行最高 5 FPS 的 damage watcher。桌面
 等布局变化仍完整重绘一次。手动刷新使用立即完成的 capture，不会被
 `copy_with_damage` 的等待语义阻塞。
 
+viewer 默认使用 `--graphics auto`。如果直连终端或 tmux 的实际 client 是 Kitty、WezTerm
+或 Ghostty，并且 tmux 开启了 `allow-passthrough`，termway 会使用
+[Kitty Graphics Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)：viewport 的传输
+分辨率最高为 1920×1080，但 placement 仍按原始宽高比铺满 terminal pane。画面按 terminal
+cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使用双缓冲 image ID 完整
+替换发生变化的 tile，新 tile 显示后才回收旧 tile，不使用 Kitty animation frame patch。
+整帧会先归一到 terminal cell 的精确宽高比，避免各 tile 独立缩放产生接缝；每个 tile 使用
+完整协议单元无空窗替换，布局或缩放变化时才重建整个 tile grid。tmux 下使用
+Unicode placeholders；每个 placeholder cell 都携带完整的 tile 行列坐标，不依赖 tmux
+局部重绘时无法保证的左邻 cell 推导。因此图片位置和 pane 坐标由 tmux 正常管理。
+modeline 会显示 `GFX:KITTY` 或 `GFX:ANSI`。
+
+Kitty 协议输出使用非阻塞 PTY 和完整协议单元队列；每个约 4 KiB 的 APC 或一行 placeholder
+发送后都会重新处理终端输入。上一帧仍在发送时不会继续堆积 damage 帧，只记录一次最新画面
+重绘请求。modeline、echo 和输入状态输出优先于图像队列，退出时最多补完当前协议单元，随后
+丢弃尚未发送的图像，避免低速 tmux/SSH 链路阻塞控制。
+
+可以显式选择或排错：
+
+```console
+termway view --graphics kitty   # 要求 Kitty Graphics 可用，否则报错
+termway view --graphics ansi    # 强制使用 truecolor half-block + cell diff
+```
+
+tmux 至少需要：
+
+```tmux
+set -g allow-passthrough on
+```
+
 交互查看器默认从 1× 全景打开：
 
 ```console
@@ -81,6 +111,7 @@ nix develop --command cargo run --release -- view
 - `c`：保持倍率并回到中心；
 - `r`：重新捕获当前画面；
 - 鼠标左键：向点击位置移动 viewport，并放大一级；
+- `MOUSE:ON` 时鼠标左键/右键：向远端桌面发送对应点击；
 - 鼠标滚轮或触控板上下滚动：垂直平移 viewport；
 - 触控板左右滚动：水平平移 viewport（取决于终端是否发送水平滚动事件）；
 - `s`（需要 `--control`）：切换滚动控制 viewport 或远端桌面；
@@ -93,12 +124,12 @@ nix develop --command cargo run --release -- view
 
 viewer 有两个互斥交互模式，鼠标控制则是独立的安全开关：
 
-| mode line | 键盘 | 左键 |
-| --- | --- | --- |
-| `NAV \| READ-ONLY` | termway 导航命令 | 渐进聚焦并放大 |
-| `NAV \| MOUSE:OFF` | termway 导航命令 | 渐进聚焦并放大 |
-| `INPUT \| MOUSE:OFF` | 发送给远端窗口 | 渐进聚焦并放大 |
-| `NAV/INPUT \| MOUSE:ON` | 取决于 NAV/INPUT | 点击远端桌面 |
+| mode line | 键盘 | 左键 | 右键 |
+| --- | --- | --- | --- |
+| `NAV \| READ-ONLY` | termway 导航命令 | 渐进聚焦并放大 | 无操作 |
+| `NAV \| MOUSE:OFF` | termway 导航命令 | 渐进聚焦并放大 | 无操作 |
+| `INPUT \| MOUSE:OFF` | 发送给远端窗口 | 渐进聚焦并放大 | 无操作 |
+| `NAV/INPUT \| MOUSE:ON` | 取决于 NAV/INPUT | 远端左键 | 远端右键 |
 
 `--control` 只授予远端输入能力，并不是一种运行模式：
 
@@ -107,7 +138,7 @@ nix develop --command cargo run --release -- view --control
 ```
 
 启动时为 `[NAV | MOUSE:OFF | SCROLL:VIEW]`。在 NAV 中按 `i` 切换 `MOUSE:OFF/ON`；只有
-`MOUSE:ON` 状态下的左键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
+`MOUSE:ON` 状态下的左键或右键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
 点击后会自动刷新一帧。该路径使用 Wayland 绝对坐标，不依赖 `ydotool`、`/dev/uinput`
 或鼠标加速度。当前输入映射仅支持 niri 的 `Normal` output transform。
 

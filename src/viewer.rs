@@ -7,8 +7,8 @@ use std::{collections::VecDeque, mem};
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
 use crossterm::terminal::{
@@ -17,11 +17,14 @@ use crossterm::terminal::{
 };
 use crossterm::{ExecutableCommand, QueueableCommand, SynchronizedUpdate};
 use image::RgbImage;
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+use rustix::io::Errno;
 
 use crate::capture;
 use crate::config::{Action, ActionRunner};
 use crate::idle::IdleInhibitor;
-use crate::input::{VirtualKeyboard, VirtualPointer};
+use crate::input::{PointerButton, VirtualKeyboard, VirtualPointer};
+use crate::kitty::{self, GraphicsMode};
 use crate::niri::OutputGeometry;
 use crate::render::{self, Viewport, ViewportRect};
 
@@ -39,8 +42,15 @@ const AXIS_SWITCH_THRESHOLD: i32 = 2;
 const AUTO_REFRESH_DELAY: Duration = Duration::from_millis(250);
 const CLICK_FOCUS_FRACTION: f32 = 0.4;
 const DAMAGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
+const KITTY_MAX_WIDTH: u32 = 1920;
+const KITTY_MAX_HEIGHT: u32 = 1080;
+const KITTY_TILE_SIZE: u32 = 128;
+const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
-pub struct ActionOptions<'a> {
+pub struct RunOptions<'a> {
+    pub control: bool,
+    pub graphics: GraphicsMode,
+    pub initial_viewport: Viewport,
     pub actions: Vec<Action>,
     pub niri_socket: &'a Path,
     pub environment: &'a [(OsString, OsString)],
@@ -51,13 +61,11 @@ pub fn run(
     wayland_display: &str,
     output_name: &str,
     output_geometry: OutputGeometry,
-    control: bool,
-    initial_viewport: Viewport,
-    action_options: ActionOptions<'_>,
+    options: RunOptions<'_>,
 ) -> Result<()> {
-    let mut state = ViewerState::new(initial_viewport, control)?;
-    state.actions = action_options.actions;
-    let mut idle_inhibitor = if control {
+    let mut state = ViewerState::new(options.initial_viewport, options.control)?;
+    state.actions = options.actions;
+    let mut idle_inhibitor = if options.control {
         match IdleInhibitor::acquire() {
             Ok(inhibitor) => {
                 state.idle_inhibited = true;
@@ -74,8 +82,8 @@ pub fn run(
     let action_runner = ActionRunner::new(
         runtime_dir,
         wayland_display,
-        action_options.niri_socket,
-        action_options.environment,
+        options.niri_socket,
+        options.environment,
     );
     let mut capturer = capture::Capturer::new(runtime_dir, wayland_display, output_name);
     let mut frame = capturer.capture()?;
@@ -94,17 +102,24 @@ pub fn run(
         None
     };
     validate_output_geometry(&frame, &output_geometry)?;
-    let pointer = control
+    let pointer = options
+        .control
         .then(|| VirtualPointer::connect(runtime_dir, wayland_display, output_name))
         .transpose()?;
-    let mut keyboard = control
+    let mut keyboard = options
+        .control
         .then(|| VirtualKeyboard::connect(runtime_dir, wayland_display))
         .transpose()?;
-    let mut terminal = Terminal::enter()?;
+    let mut terminal = Terminal::enter(options.graphics)?;
+    state.graphics_backend = terminal.backend_name();
+    if let Some(reason) = terminal.take_fallback_reason() {
+        state.message(format!("Using ANSI graphics: {reason}"));
+    }
     let mut layout = terminal.draw(&frame, output_name, &state)?;
     let mut pending_events = VecDeque::new();
 
     loop {
+        let output_progress = terminal.pump_output()?;
         if let Some(watcher) = &damage_watcher {
             match watcher.take_latest() {
                 Ok(Some(update)) => {
@@ -125,6 +140,9 @@ pub fn run(
                 }
             }
         }
+        if terminal.take_deferred_redraw() {
+            layout = terminal.draw(&frame, output_name, &state)?;
+        }
         let terminal_event = if let Some(pending) = pending_events.pop_front() {
             pending
         } else {
@@ -138,9 +156,18 @@ pub fn run(
                     })
                 },
             );
+            let timeout = if terminal.has_pending_output() {
+                let retry = if output_progress {
+                    Duration::ZERO
+                } else {
+                    OUTPUT_RETRY_INTERVAL
+                };
+                Some(timeout.map_or(retry, |timeout| timeout.min(retry)))
+            } else {
+                timeout
+            };
             if let Some(timeout) = timeout
-                && (timeout.is_zero()
-                    || !event::poll(timeout).context("cannot poll terminal events")?)
+                && !event::poll(timeout).context("cannot poll terminal events")?
             {
                 let auto_refresh = state.take_due_auto_refresh();
                 let message_expired = state.expire_message();
@@ -276,7 +303,7 @@ pub fn run(
                     }
                     continue;
                 }
-                if let Some(point) = map_left_click(mouse, layout, &output_geometry) {
+                if let Some((point, button)) = map_click(mouse, layout, &output_geometry) {
                     let mut frame_changed = false;
                     if state.control && state.mouse_armed {
                         if let Some(pointer) = &pointer {
@@ -285,10 +312,15 @@ pub fn run(
                                 point.local_y,
                                 output_geometry.width,
                                 output_geometry.height,
+                                button,
                             ) {
                                 Ok(()) => {
                                     state.message(format!(
-                                        "clicked {}:{} (global {},{})",
+                                        "{} clicked {}:{} (global {},{})",
+                                        match button {
+                                            PointerButton::Left => "Left",
+                                            PointerButton::Right => "Right",
+                                        },
                                         point.local_x,
                                         point.local_y,
                                         point.global_x,
@@ -307,7 +339,9 @@ pub fn run(
                                 }
                             }
                         }
-                    } else if state.zoom_toward(point, layout) == Effect::Redraw {
+                    } else if button == PointerButton::Left
+                        && state.zoom_toward(point, layout) == Effect::Redraw
+                    {
                         state.message(format!(
                             "Focused toward {}:{}; {:.2}x",
                             point.local_x, point.local_y, state.viewport.zoom
@@ -323,6 +357,10 @@ pub fn run(
                 }
             }
             Event::Resize(_, _) => layout = terminal.draw(&frame, output_name, &state)?,
+            Event::FocusGained => {
+                terminal.invalidate_image();
+                layout = terminal.draw(&frame, output_name, &state)?;
+            }
             _ => {}
         }
     }
@@ -335,6 +373,7 @@ struct ViewerState {
     message: Option<EchoMessage>,
     control: bool,
     idle_inhibited: bool,
+    graphics_backend: &'static str,
     mouse_armed: bool,
     scroll_target: ScrollTarget,
     mode: InteractionMode,
@@ -390,6 +429,7 @@ impl ViewerState {
             message: None,
             control,
             idle_inhibited: false,
+            graphics_backend: "ANSI",
             mouse_armed: false,
             scroll_target: ScrollTarget::View,
             mode: InteractionMode::Nav,
@@ -508,6 +548,15 @@ impl ViewerState {
     }
 
     fn handle_view_command(&mut self, key: KeyEvent) -> Option<Effect> {
+        // Traditional terminal encoding aliases C-\\ and C-4 to the same control byte. Some
+        // terminals therefore report the command prefix as Char('4') + CONTROL. View commands
+        // are deliberately unmodified single keys, so never interpret that event as 4x zoom.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return None;
+        }
         let effect = match key.code {
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.set_zoom((self.viewport.zoom * ZOOM_STEP).min(MAX_ZOOM))
@@ -961,19 +1010,138 @@ fn collect_scroll_batch(
     Ok(scrolls)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputKind {
+    Control,
+    Graphics,
+}
+
+struct OutputSegment {
+    kind: OutputKind,
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+struct OutputPump {
+    original_flags: OFlags,
+    active: Option<OutputSegment>,
+    control: VecDeque<Vec<u8>>,
+    graphics: VecDeque<Vec<u8>>,
+}
+
+impl OutputPump {
+    fn new(stdout: &Stdout) -> Result<Self> {
+        let original_flags = fcntl_getfl(stdout).context("cannot read stdout flags")?;
+        fcntl_setfl(stdout, original_flags | OFlags::NONBLOCK)
+            .context("cannot enable non-blocking stdout")?;
+        Ok(Self {
+            original_flags,
+            active: None,
+            control: VecDeque::new(),
+            graphics: VecDeque::new(),
+        })
+    }
+
+    fn enqueue_control(&mut self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.control.push_back(bytes);
+        }
+    }
+
+    fn enqueue_graphics(&mut self, segments: Vec<Vec<u8>>) {
+        self.graphics
+            .extend(segments.into_iter().filter(|segment| !segment.is_empty()));
+    }
+
+    fn has_pending(&self) -> bool {
+        self.active.is_some() || !self.control.is_empty() || !self.graphics.is_empty()
+    }
+
+    fn graphics_busy(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|segment| segment.kind == OutputKind::Graphics)
+            || !self.graphics.is_empty()
+    }
+
+    fn activate_next(&mut self) {
+        if self.active.is_none() {
+            self.active = self
+                .control
+                .pop_front()
+                .map(|bytes| OutputSegment {
+                    kind: OutputKind::Control,
+                    bytes,
+                    offset: 0,
+                })
+                .or_else(|| {
+                    self.graphics.pop_front().map(|bytes| OutputSegment {
+                        kind: OutputKind::Graphics,
+                        bytes,
+                        offset: 0,
+                    })
+                });
+        }
+    }
+
+    fn pump(&mut self, stdout: &Stdout) -> Result<bool> {
+        self.activate_next();
+        let Some(active) = &mut self.active else {
+            return Ok(false);
+        };
+        match rustix::io::write(stdout, &active.bytes[active.offset..]) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+            Ok(written) => active.offset += written,
+            Err(Errno::AGAIN) => return Ok(false),
+            Err(Errno::INTR) => return Ok(false),
+            Err(error) => {
+                return Err(io::Error::from(error)).context("cannot write terminal output");
+            }
+        }
+        if active.offset == active.bytes.len() {
+            self.active = None;
+        }
+        Ok(true)
+    }
+
+    fn restore_blocking(&self, stdout: &Stdout) -> io::Result<()> {
+        fcntl_setfl(stdout, self.original_flags).map_err(io::Error::from)
+    }
+
+    fn take_active_remainder(&mut self) -> Option<Vec<u8>> {
+        self.control.clear();
+        self.graphics.clear();
+        self.active
+            .take()
+            .map(|active| active.bytes[active.offset..].to_vec())
+            .filter(|bytes| !bytes.is_empty())
+    }
+}
+
 struct Terminal {
     stdout: Stdout,
+    kitty: Option<kitty::Renderer>,
+    output_pump: Option<OutputPump>,
+    fallback_reason: Option<String>,
     last_image: Option<ImageCache>,
+    last_kitty_image: Option<KittyImageCache>,
+    force_kitty_redraw: bool,
+    deferred_kitty_redraw: bool,
     last_mode_line: Option<(u16, String, bool)>,
     last_echo: Option<(u16, String)>,
 }
 
 impl Terminal {
-    fn enter() -> Result<Self> {
+    fn enter(graphics: GraphicsMode) -> Result<Self> {
+        let (kitty, fallback_reason) = match kitty::Selection::select(graphics)? {
+            kitty::Selection::Ansi { reason } => (None, reason),
+            kitty::Selection::Kitty(renderer) => (Some(renderer), None),
+        };
         enable_raw_mode().context("cannot enable terminal raw mode")?;
         let mut stdout = io::stdout();
         if let Err(error) = stdout.execute(EnterAlternateScreen).and_then(|stdout| {
             stdout.execute(Hide)?;
+            stdout.execute(EnableFocusChange)?;
             stdout.execute(EnableMouseCapture)?;
             stdout.execute(crossterm::terminal::DisableLineWrap)?;
             stdout.execute(Clear(ClearType::All))?;
@@ -982,12 +1150,75 @@ impl Terminal {
             let _ = disable_raw_mode();
             return Err(error).context("cannot initialize the interactive terminal");
         }
+        let output_pump = if kitty.is_some() {
+            match OutputPump::new(&stdout) {
+                Ok(output) => Some(output),
+                Err(error) => {
+                    let _ = stdout.execute(Show);
+                    let _ = stdout.execute(LeaveAlternateScreen);
+                    let _ = disable_raw_mode();
+                    return Err(error).context("cannot make Kitty output non-blocking");
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             stdout,
+            kitty,
+            output_pump,
+            fallback_reason,
             last_image: None,
+            last_kitty_image: None,
+            force_kitty_redraw: false,
+            deferred_kitty_redraw: false,
             last_mode_line: None,
             last_echo: None,
         })
+    }
+
+    fn backend_name(&self) -> &'static str {
+        if self.kitty.is_some() {
+            "KITTY"
+        } else {
+            "ANSI"
+        }
+    }
+
+    fn take_fallback_reason(&mut self) -> Option<String> {
+        self.fallback_reason.take()
+    }
+
+    fn invalidate_image(&mut self) {
+        self.last_image = None;
+        self.force_kitty_redraw = true;
+    }
+
+    fn pump_output(&mut self) -> Result<bool> {
+        if let Some(output) = &mut self.output_pump {
+            return output.pump(&self.stdout);
+        }
+        Ok(false)
+    }
+
+    fn has_pending_output(&self) -> bool {
+        self.output_pump
+            .as_ref()
+            .is_some_and(OutputPump::has_pending)
+    }
+
+    fn take_deferred_redraw(&mut self) -> bool {
+        if self.deferred_kitty_redraw
+            && self
+                .output_pump
+                .as_ref()
+                .is_none_or(|output| !output.graphics_busy())
+        {
+            self.deferred_kitty_redraw = false;
+            true
+        } else {
+            false
+        }
     }
 
     fn draw(
@@ -998,6 +1229,9 @@ impl Terminal {
     ) -> Result<DrawLayout> {
         let (cols, rows) = crossterm::terminal::size()?;
         let image_rows = rows.saturating_sub(2).max(1);
+        if self.kitty.is_some() {
+            return self.draw_kitty(frame, output_name, state, cols.max(1), image_rows, rows);
+        }
         let rendered =
             render::render_half_blocks_viewport(frame, cols.max(1), image_rows, state.viewport)?;
         let layout = DrawLayout {
@@ -1039,6 +1273,123 @@ impl Terminal {
             mode_y,
             cells: rendered.cells,
         });
+        self.draw_chrome(output_name, state, layout)?;
+        Ok(layout)
+    }
+
+    fn draw_kitty(
+        &mut self,
+        frame: &RgbImage,
+        output_name: &str,
+        state: &ViewerState,
+        max_cols: u16,
+        max_rows: u16,
+        terminal_rows: u16,
+    ) -> Result<DrawLayout> {
+        if self
+            .output_pump
+            .as_ref()
+            .is_some_and(OutputPump::graphics_busy)
+        {
+            self.deferred_kitty_redraw = true;
+            let layout = self
+                .last_kitty_image
+                .as_ref()
+                .expect("a queued Kitty frame has a cache")
+                .layout;
+            self.draw_chrome(output_name, state, layout)?;
+            return Ok(layout);
+        }
+        let window = crossterm::terminal::window_size().ok();
+        let cell_width = window
+            .as_ref()
+            .filter(|size| size.width > 0 && size.columns > 0)
+            .map_or(10, |size| u32::from(size.width) / u32::from(size.columns));
+        let cell_height = window
+            .as_ref()
+            .filter(|size| size.height > 0 && size.rows > 0)
+            .map_or(20, |size| u32::from(size.height) / u32::from(size.rows));
+        let cell_width = cell_width.max(1);
+        let cell_height = cell_height.max(1);
+        let display_pixel_width = u32::from(max_cols) * cell_width;
+        let display_pixel_height = u32::from(max_rows) * cell_height;
+        let mut raster = render::render_raster_viewport(
+            frame,
+            display_pixel_width.min(KITTY_MAX_WIDTH),
+            display_pixel_height.min(KITTY_MAX_HEIGHT),
+            state.viewport,
+        )?;
+        // The transmitted raster may be capped to protect the SSH link, but its placement and
+        // pointer geometry must still fill the terminal's full aspect-fitted rectangle.
+        let (display_width, display_height) = render::fit_dimensions(
+            raster.viewport.width,
+            raster.viewport.height,
+            display_pixel_width,
+            display_pixel_height,
+        );
+        let cols = display_width.div_ceil(cell_width).min(u32::from(max_cols)) as u16;
+        let rows = display_height
+            .div_ceil(cell_height)
+            .min(u32::from(max_rows)) as u16;
+        let layout = DrawLayout {
+            cols: cols.max(1),
+            rows: rows.max(1),
+            sample_height: rows.max(1).saturating_mul(2),
+            viewport: raster.viewport,
+            source_width: frame.width(),
+            source_height: frame.height(),
+        };
+        raster.image = render::align_raster_to_cell_grid(
+            &raster.image,
+            layout.cols,
+            layout.rows,
+            cell_width,
+            cell_height,
+            KITTY_MAX_WIDTH,
+            KITTY_MAX_HEIGHT,
+        );
+        let previous = self.last_kitty_image.as_ref().filter(|previous| {
+            previous.layout == layout && previous.image.dimensions() == raster.image.dimensions()
+        });
+        let previous_layout = self
+            .last_kitty_image
+            .as_ref()
+            .map(|previous| previous.layout);
+        let reset = self.force_kitty_redraw || previous.is_none();
+        let tiles = render::changed_raster_tiles(
+            (!reset)
+                .then_some(previous)
+                .flatten()
+                .map(|previous| &previous.image),
+            &raster.image,
+            layout.cols,
+            layout.rows,
+            KITTY_TILE_SIZE,
+        );
+        let renderer = self.kitty.as_mut().expect("Kitty renderer was selected");
+        let mut segments = renderer.encode_tiles(&tiles, reset)?;
+        if let Some(previous_layout) = previous_layout
+            && previous_layout != layout
+        {
+            let mut cleanup = Vec::new();
+            clear_stale_kitty_cells(&mut cleanup, previous_layout, layout, terminal_rows)?;
+            if !cleanup.is_empty() {
+                segments.push(cleanup);
+            }
+        }
+        if !segments.is_empty() {
+            self.output_pump
+                .as_mut()
+                .expect("Kitty output pump was initialized")
+                .enqueue_graphics(segments);
+        }
+        self.last_image = None;
+        self.last_kitty_image = Some(KittyImageCache {
+            layout,
+            image: raster.image,
+        });
+        self.force_kitty_redraw = false;
+        self.deferred_kitty_redraw = false;
         self.draw_chrome(output_name, state, layout)?;
         Ok(layout)
     }
@@ -1092,7 +1443,8 @@ impl Terminal {
         };
         let mode_line = fit_status(
             &format!(
-                " - Termway: {output_name}  [{mode} | {mouse} | {scroll} | {idle}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  a idle  r refresh  q quit ",
+                " - Termway: {output_name}  [{mode} | {mouse} | {scroll} | {idle} | GFX:{}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  a idle  r refresh  q quit ",
+                state.graphics_backend,
                 state.viewport.zoom,
                 state.viewport.center_x * 100.0,
                 state.viewport.center_y * 100.0,
@@ -1107,18 +1459,17 @@ impl Terminal {
         if self.last_mode_line.as_ref() == Some(&signature) {
             return Ok(());
         }
-        self.stdout.sync_update(|stdout| -> io::Result<()> {
-            stdout.queue(MoveTo(0, mode_y))?;
-            stdout.queue(ResetColor)?;
-            stdout.queue(SetAttribute(Attribute::Reverse))?;
-            if remote_pointer_active {
-                stdout.queue(SetAttribute(Attribute::Bold))?;
-            }
-            stdout.queue(Print(mode_line))?;
-            stdout.queue(SetAttribute(Attribute::Reset))?;
-            stdout.queue(ResetColor)?;
-            Ok(())
-        })??;
+        let mut bytes = Vec::new();
+        bytes.queue(MoveTo(0, mode_y))?;
+        bytes.queue(ResetColor)?;
+        bytes.queue(SetAttribute(Attribute::Reverse))?;
+        if remote_pointer_active {
+            bytes.queue(SetAttribute(Attribute::Bold))?;
+        }
+        bytes.queue(Print(mode_line))?;
+        bytes.queue(SetAttribute(Attribute::Reset))?;
+        bytes.queue(ResetColor)?;
+        self.write_control(bytes)?;
         self.last_mode_line = Some(signature);
         Ok(())
     }
@@ -1144,14 +1495,23 @@ impl Terminal {
         if self.last_echo.as_ref() == Some(&signature) {
             return Ok(());
         }
-        self.stdout.sync_update(|stdout| -> io::Result<()> {
-            stdout.queue(MoveTo(0, echo_y))?;
-            stdout.queue(SetAttribute(Attribute::Reset))?;
-            stdout.queue(ResetColor)?;
-            stdout.queue(Print(echo))?;
-            Ok(())
-        })??;
+        let mut bytes = Vec::new();
+        bytes.queue(MoveTo(0, echo_y))?;
+        bytes.queue(SetAttribute(Attribute::Reset))?;
+        bytes.queue(ResetColor)?;
+        bytes.queue(Print(echo))?;
+        self.write_control(bytes)?;
         self.last_echo = Some(signature);
+        Ok(())
+    }
+
+    fn write_control(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if let Some(output) = &mut self.output_pump {
+            output.enqueue_control(bytes);
+        } else {
+            self.stdout
+                .sync_update(|stdout| stdout.write_all(&bytes))??;
+        }
         Ok(())
     }
 }
@@ -1262,15 +1622,48 @@ fn char_keycode(character: char) -> Option<(u32, bool)> {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        if let Some(mut output) = self.output_pump.take() {
+            let active_remainder = output.take_active_remainder();
+            let _ = output.restore_blocking(&self.stdout);
+            if let Some(bytes) = active_remainder {
+                let _ = self.stdout.write_all(&bytes);
+            }
+        }
+        if let Some(renderer) = &mut self.kitty {
+            for segment in renderer.encode_delete() {
+                let _ = self.stdout.write_all(&segment);
+            }
+        }
         let _ = self.stdout.execute(EndSynchronizedUpdate);
         let _ = self.stdout.execute(SetAttribute(Attribute::Reset));
         let _ = self.stdout.execute(ResetColor);
+        let _ = self.stdout.execute(DisableFocusChange);
         let _ = self.stdout.execute(DisableMouseCapture);
         let _ = self.stdout.execute(crossterm::terminal::EnableLineWrap);
         let _ = self.stdout.execute(Show);
         let _ = self.stdout.execute(LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
+}
+
+fn clear_stale_kitty_cells<W: Write>(
+    stdout: &mut W,
+    previous: DrawLayout,
+    current: DrawLayout,
+    terminal_rows: u16,
+) -> io::Result<()> {
+    let mode_y = terminal_rows.saturating_sub(2);
+    if previous.cols > current.cols {
+        for row in 0..previous.rows.min(current.rows).min(mode_y) {
+            stdout.queue(MoveTo(current.cols, row))?;
+            stdout.queue(Clear(ClearType::UntilNewLine))?;
+        }
+    }
+    for row in current.rows..previous.rows.min(mode_y) {
+        stdout.queue(MoveTo(0, row))?;
+        stdout.queue(Clear(ClearType::CurrentLine))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1283,6 +1676,11 @@ struct DrawLayout {
     source_height: u32,
 }
 
+struct KittyImageCache {
+    layout: DrawLayout,
+    image: RgbImage,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LogicalPoint {
     source_x: u32,
@@ -1293,15 +1691,17 @@ struct LogicalPoint {
     global_y: i64,
 }
 
-fn map_left_click(
+fn map_click(
     mouse: MouseEvent,
     layout: DrawLayout,
     output: &OutputGeometry,
-) -> Option<LogicalPoint> {
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return None;
-    }
-    map_pointer_position(mouse, layout, output)
+) -> Option<(LogicalPoint, PointerButton)> {
+    let button = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => PointerButton::Left,
+        MouseEventKind::Down(MouseButton::Right) => PointerButton::Right,
+        _ => return None,
+    };
+    map_pointer_position(mouse, layout, output).map(|point| (point, button))
 }
 
 fn map_pointer_position(
@@ -1404,6 +1804,25 @@ fn fit_status(status: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_pump_prioritizes_control_between_complete_graphics_segments() {
+        let mut output = OutputPump {
+            original_flags: OFlags::empty(),
+            active: None,
+            control: VecDeque::new(),
+            graphics: VecDeque::new(),
+        };
+        output.enqueue_graphics(vec![b"graphics-1".to_vec(), b"graphics-2".to_vec()]);
+        output.enqueue_control(b"control".to_vec());
+
+        output.activate_next();
+        assert_eq!(output.active.as_ref().unwrap().kind, OutputKind::Control);
+        output.active = None;
+        output.activate_next();
+        assert_eq!(output.active.as_ref().unwrap().kind, OutputKind::Graphics);
+        assert!(output.graphics_busy());
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1585,6 +2004,15 @@ mod tests {
         assert_eq!(state.handle_key(key(KeyCode::Right)), Effect::Redraw);
         assert_eq!(state.viewport.center_x, 0.54);
         assert_eq!(state.mode, InteractionMode::Input);
+    }
+
+    #[test]
+    fn modified_digits_do_not_trigger_nav_zoom() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        let aliased_prefix = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
+        assert!(is_command_prefix(aliased_prefix));
+        assert_eq!(state.handle_key(aliased_prefix), Effect::None);
+        assert_eq!(state.viewport.zoom, 1.0);
     }
 
     #[test]
@@ -1782,7 +2210,7 @@ mod tests {
             scale: 1.25,
             transform: "Normal".into(),
         };
-        let point = map_left_click(
+        let (point, button) = map_click(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 49,
@@ -1793,6 +2221,7 @@ mod tests {
             &output,
         )
         .unwrap();
+        assert_eq!(button, PointerButton::Left);
         assert_eq!(
             point,
             LogicalPoint {
@@ -1804,6 +2233,18 @@ mod tests {
                 global_y: 496,
             }
         );
+        let (_, button) = map_click(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 49,
+                row: 24,
+                modifiers: KeyModifiers::NONE,
+            },
+            layout,
+            &output,
+        )
+        .unwrap();
+        assert_eq!(button, PointerButton::Right);
     }
 
     #[test]
@@ -1873,10 +2314,10 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        assert!(map_left_click(mouse(80, 0), layout, &output).is_none());
-        assert!(map_left_click(mouse(0, 20), layout, &output).is_none());
+        assert!(map_click(mouse(80, 0), layout, &output).is_none());
+        assert!(map_click(mouse(0, 20), layout, &output).is_none());
         output.transform = "90".into();
-        assert!(map_left_click(mouse(0, 0), layout, &output).is_none());
+        assert!(map_click(mouse(0, 0), layout, &output).is_none());
     }
 
     #[test]

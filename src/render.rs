@@ -36,6 +36,20 @@ pub struct RenderedFrame {
     pub viewport: ViewportRect,
 }
 
+pub struct RasterFrame {
+    pub image: RgbImage,
+    pub viewport: ViewportRect,
+}
+
+pub struct RasterTile {
+    pub image: RgbImage,
+    pub index: u32,
+    pub col: u16,
+    pub row: u16,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     foreground: [u8; 3],
@@ -102,6 +116,158 @@ pub fn render_half_blocks_viewport(
         rows: rows as u16,
         sample_height: sample_height as u16,
         viewport,
+    })
+}
+
+pub fn render_raster_viewport(
+    source: &RgbImage,
+    max_width: u32,
+    max_height: u32,
+    viewport: Viewport,
+) -> Result<RasterFrame> {
+    validate_viewport(viewport)?;
+    let viewport = viewport_rect(source.width(), source.height(), viewport);
+    let cropped = image::imageops::crop_imm(
+        source,
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height,
+    )
+    .to_image();
+    let (fitted_width, fitted_height) = fitted_sample_size(
+        viewport.width,
+        viewport.height,
+        max_width.max(1),
+        max_height.max(1),
+    );
+    let scale = (fitted_width as f64 / viewport.width as f64)
+        .min(fitted_height as f64 / viewport.height as f64)
+        .min(1.0);
+    let width = (viewport.width as f64 * scale).round().max(1.0) as u32;
+    let height = (viewport.height as f64 * scale).round().max(1.0) as u32;
+    let image = if width == viewport.width && height == viewport.height {
+        cropped
+    } else {
+        image::imageops::resize(&cropped, width, height, FilterType::Triangle)
+    };
+    Ok(RasterFrame { image, viewport })
+}
+
+pub fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    fitted_sample_size(width, height, max_width.max(1), max_height.max(1))
+}
+
+pub fn align_raster_to_cell_grid(
+    image: &RgbImage,
+    cols: u16,
+    rows: u16,
+    cell_width: u32,
+    cell_height: u32,
+    max_width: u32,
+    max_height: u32,
+) -> RgbImage {
+    assert!(cols > 0 && rows > 0);
+    assert!(cell_width > 0 && cell_height > 0);
+    let divisor = gcd(cell_width, cell_height);
+    let base_width = u32::from(cols) * (cell_width / divisor);
+    let base_height = u32::from(rows) * (cell_height / divisor);
+    let maximum_scale = (max_width / base_width)
+        .min(max_height / base_height)
+        .max(1);
+    let source_scale = ((image.width() as f64 / base_width as f64)
+        .min(image.height() as f64 / base_height as f64)
+        .round() as u32)
+        .max(1);
+    let scale = source_scale.min(maximum_scale);
+    let width = base_width * scale;
+    let height = base_height * scale;
+    if image.dimensions() == (width, height) {
+        image.clone()
+    } else {
+        image::imageops::resize(image, width, height, FilterType::Triangle)
+    }
+}
+
+fn gcd(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
+pub fn changed_raster_tiles(
+    previous: Option<&RgbImage>,
+    current: &RgbImage,
+    display_cols: u16,
+    display_rows: u16,
+    target_tile_size: u32,
+) -> Vec<RasterTile> {
+    if let Some(previous) = previous {
+        assert_eq!(previous.dimensions(), current.dimensions());
+    }
+    assert!(display_cols > 0 && display_rows > 0);
+    assert!(target_tile_size > 0);
+    let (width, height) = current.dimensions();
+    let tile_cell_cols = cells_for_target_pixels(target_tile_size, width, display_cols);
+    let tile_cell_rows = cells_for_target_pixels(target_tile_size, height, display_rows);
+    let grid_cols = u32::from(display_cols).div_ceil(u32::from(tile_cell_cols));
+    let grid_rows = u32::from(display_rows).div_ceil(u32::from(tile_cell_rows));
+    let mut tiles = Vec::new();
+    for tile_row in 0..grid_rows {
+        let row = tile_row * u32::from(tile_cell_rows);
+        let rows = u32::from(tile_cell_rows).min(u32::from(display_rows) - row);
+        let y = pixel_boundary(row, height, display_rows);
+        let bottom = pixel_boundary(row + rows, height, display_rows);
+        for tile_col in 0..grid_cols {
+            let col = tile_col * u32::from(tile_cell_cols);
+            let cols = u32::from(tile_cell_cols).min(u32::from(display_cols) - col);
+            let x = pixel_boundary(col, width, display_cols);
+            let right = pixel_boundary(col + cols, width, display_cols);
+            let tile_width = right - x;
+            let tile_height = bottom - y;
+            if previous.is_some_and(|previous| {
+                !region_changed(previous, current, x, y, tile_width, tile_height)
+            }) {
+                continue;
+            }
+            tiles.push(RasterTile {
+                image: image::imageops::crop_imm(current, x, y, tile_width, tile_height).to_image(),
+                index: tile_row * grid_cols + tile_col,
+                col: col as u16,
+                row: row as u16,
+                cols: cols as u16,
+                rows: rows as u16,
+            });
+        }
+    }
+    tiles
+}
+
+fn cells_for_target_pixels(target: u32, pixels: u32, cells: u16) -> u16 {
+    let cells = u32::from(cells);
+    ((u64::from(target) * u64::from(cells)).div_ceil(u64::from(pixels)) as u32).clamp(1, cells)
+        as u16
+}
+
+fn pixel_boundary(cell: u32, pixels: u32, cells: u16) -> u32 {
+    (u64::from(cell) * u64::from(pixels) / u64::from(cells)) as u32
+}
+
+fn region_changed(
+    previous: &RgbImage,
+    current: &RgbImage,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    let row_bytes = width as usize * 3;
+    let image_row_bytes = previous.width() as usize * 3;
+    let x = x as usize * 3;
+    (y..y + height).any(|row| {
+        let start = row as usize * image_row_bytes + x;
+        previous.as_raw()[start..start + row_bytes] != current.as_raw()[start..start + row_bytes]
     })
 }
 
@@ -321,5 +487,53 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn raster_viewport_downscales_but_does_not_wastefully_upscale() {
+        let image = RgbImage::new(100, 50);
+        let downscaled = render_raster_viewport(&image, 40, 40, Viewport::default()).unwrap();
+        assert_eq!(downscaled.image.dimensions(), (40, 20));
+
+        let original = render_raster_viewport(&image, 200, 200, Viewport::default()).unwrap();
+        assert_eq!(original.image.dimensions(), (100, 50));
+    }
+
+    #[test]
+    fn raster_resolution_can_be_capped_without_shrinking_its_display_box() {
+        let image = RgbImage::new(3200, 1800);
+        let raster = render_raster_viewport(&image, 1920, 1080, Viewport::default()).unwrap();
+        assert_eq!(raster.image.dimensions(), (1920, 1080));
+        assert_eq!(
+            fit_dimensions(raster.viewport.width, raster.viewport.height, 3200, 1800),
+            (3200, 1800)
+        );
+    }
+
+    #[test]
+    fn cell_aligned_raster_has_the_exact_placement_aspect_ratio() {
+        let image = RgbImage::new(320, 180);
+        let aligned = align_raster_to_cell_grid(&image, 40, 12, 8, 16, 1920, 1080);
+        assert_eq!(aligned.dimensions(), (320, 192));
+        assert_eq!(aligned.width() * 12 * 16, aligned.height() * 40 * 8);
+    }
+
+    #[test]
+    fn raster_tiles_are_cell_aligned_and_only_emit_changes() {
+        let previous = RgbImage::new(320, 180);
+        let mut current = previous.clone();
+        current.put_pixel(150, 20, Rgb([1, 2, 3]));
+        let tiles = changed_raster_tiles(Some(&previous), &current, 40, 18, 128);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].index, 1);
+        assert_eq!((tiles[0].col, tiles[0].row), (16, 0));
+        assert_eq!((tiles[0].cols, tiles[0].rows), (16, 13));
+        assert_eq!(tiles[0].image.dimensions(), (128, 130));
+
+        let all = changed_raster_tiles(None, &current, 40, 18, 128);
+        assert_eq!(all.len(), 6);
+        assert_eq!(all.last().unwrap().index, 5);
+        assert_eq!((all.last().unwrap().cols, all.last().unwrap().rows), (8, 5));
+        assert_eq!(all.last().unwrap().image.dimensions(), (64, 50));
     }
 }

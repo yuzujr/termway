@@ -20,6 +20,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 };
 
 const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
 const SCROLL_DISTANCE_PER_STEP: f64 = 15.0;
 const XKB_KEYMAP: &str = concat!(
     "xkb_keymap {\n",
@@ -37,6 +38,21 @@ pub struct VirtualPointer {
     _manager: ZwlrVirtualPointerManagerV1,
     pointer: ZwlrVirtualPointerV1,
     started: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerButton {
+    Left,
+    Right,
+}
+
+impl PointerButton {
+    fn evdev_code(self) -> u32 {
+        match self {
+            Self::Left => BTN_LEFT,
+            Self::Right => BTN_RIGHT,
+        }
+    }
 }
 
 pub struct VirtualKeyboard {
@@ -114,7 +130,14 @@ impl VirtualPointer {
         })
     }
 
-    pub fn click(&self, x: u32, y: u32, width: u32, height: u32) -> Result<()> {
+    pub fn click(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        button: PointerButton,
+    ) -> Result<()> {
         if width == 0 || height == 0 || x >= width || y >= height {
             bail!("refusing out-of-bounds pointer coordinate ({x},{y}) in {width}x{height}");
         }
@@ -122,10 +145,10 @@ impl VirtualPointer {
         self.pointer.motion_absolute(time, x, y, width, height);
         self.pointer.frame();
         self.pointer
-            .button(time, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+            .button(time, button.evdev_code(), wl_pointer::ButtonState::Pressed);
         self.pointer.frame();
         self.pointer
-            .button(time, BTN_LEFT, wl_pointer::ButtonState::Released);
+            .button(time, button.evdev_code(), wl_pointer::ButtonState::Released);
         self.pointer.frame();
         self.connection
             .flush()
@@ -362,5 +385,11 @@ mod tests {
         assert!(keymap.contains("key <K1> { [ U4F60 ] };"));
         assert!(keymap.contains("key <K2> { [ U1F600 ] };"));
         assert!(keymap.ends_with('\0'));
+    }
+
+    #[test]
+    fn maps_virtual_pointer_buttons_to_linux_evdev_codes() {
+        assert_eq!(PointerButton::Left.evdev_code(), BTN_LEFT);
+        assert_eq!(PointerButton::Right.evdev_code(), BTN_RIGHT);
     }
 }

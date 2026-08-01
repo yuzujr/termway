@@ -3,6 +3,7 @@ mod config;
 mod discovery;
 mod idle;
 mod input;
+mod kitty;
 mod niri;
 mod render;
 mod screencopy;
@@ -86,6 +87,10 @@ enum Command {
         /// Allow mouse clicks after explicitly arming control with `i`.
         #[arg(long)]
         control: bool,
+
+        /// Select terminal image rendering, probing known terminal environments in auto mode.
+        #[arg(long, value_enum, default_value_t = kitty::GraphicsMode::Auto)]
+        graphics: kitty::GraphicsMode,
     },
 }
 
@@ -111,46 +116,49 @@ fn main() -> Result<()> {
             center_x,
             center_y,
             control,
+            graphics,
         } => view(
             discovered,
-            output,
-            zoom,
-            center_x,
-            center_y,
-            control,
-            config.actions,
+            ViewOptions {
+                output,
+                viewport: render::Viewport {
+                    zoom,
+                    center_x,
+                    center_y,
+                },
+                control,
+                graphics,
+                actions: config.actions,
+            },
         ),
     }
 }
 
-fn view(
-    discovered: discovery::GraphicalSession,
+struct ViewOptions {
     output: Option<String>,
-    zoom: f32,
-    center_x: f32,
-    center_y: f32,
+    viewport: render::Viewport,
     control: bool,
+    graphics: kitty::GraphicsMode,
     actions: Vec<config::Action>,
-) -> Result<()> {
+}
+
+fn view(discovered: discovery::GraphicalSession, options: ViewOptions) -> Result<()> {
     let display = discovered
         .wayland_display
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("could not discover WAYLAND_DISPLAY"))?;
-    let output = resolve_output(&discovered, output)?;
+    let output = resolve_output(&discovered, options.output)?;
     let geometry = niri::Client::connect(&discovered.socket_path)?.output_geometry(&output)?;
     viewer::run(
         &discovered.runtime_dir,
         display,
         &output,
         geometry,
-        control,
-        render::Viewport {
-            zoom,
-            center_x,
-            center_y,
-        },
-        viewer::ActionOptions {
-            actions,
+        viewer::RunOptions {
+            control: options.control,
+            graphics: options.graphics,
+            initial_viewport: options.viewport,
+            actions: options.actions,
             niri_socket: &discovered.socket_path,
             environment: &discovered.action_environment,
         },
