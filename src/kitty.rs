@@ -1,11 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::io::{self, Write};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clap::ValueEnum;
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder, RgbImage};
 
@@ -14,10 +22,14 @@ use crate::render::{RasterTile, ViewportRect};
 const PAYLOAD_CHUNK_SIZE: usize = 4096;
 const TILE_PLACEMENT_ID: u32 = 1;
 const ATLAS_PLACEMENT_ID: u32 = 2;
+const ANCHOR_PLACEMENT_ID: u32 = 3;
 const MAX_TILE_INDEX: u32 = 0x0ffe;
+const ANCHOR_IMAGE_OFFSET: u32 = 0x1ffd;
 const ATLAS_IMAGE_OFFSETS: [u32; 2] = [0x1ffe, 0x1fff];
 const PLACEHOLDER: char = '\u{10eeee}';
 const DIACRITIC_COUNT: usize = 297;
+const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 // Compact form of Kitty's canonical rowcolumn-diacritics.txt. Keeping the complete table lets
 // tmux placeholders address wide panes without relying on fragile left-neighbour inference.
 const DIACRITIC_RANGES: &[(u32, u32)] = &[
@@ -195,13 +207,39 @@ impl Renderer {
             first_id
         };
         let previous_id = self.active_atlas;
+        let anchor_ready = previous_id.is_some();
         let mut output = Vec::new();
-        push_upload(&mut output, self.transport, image_id, image)?;
-        push_atlas_placement(&mut output, self.transport, image_id, crop, cols, rows);
-        self.delete_active_tiles(&mut output);
-        if let Some(previous_id) = previous_id {
-            push_delete_image(&mut output, self.transport, previous_id);
+        if self.transport == Transport::Tmux && !anchor_ready {
+            push_upload(
+                &mut output,
+                self.transport,
+                self.image_id_base + ANCHOR_IMAGE_OFFSET,
+                &RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0])),
+            )?;
         }
+        push_upload(&mut output, self.transport, image_id, image)?;
+        let mut transition = Vec::new();
+        if self.transport == Transport::Tmux && !anchor_ready {
+            push_anchor_placement(
+                &mut transition,
+                self.transport,
+                self.image_id_base + ANCHOR_IMAGE_OFFSET,
+            );
+        }
+        push_atlas_placement(
+            &mut transition,
+            self.transport,
+            image_id,
+            self.anchor_image_id(),
+            crop,
+            cols,
+            rows,
+        );
+        self.delete_active_tiles(&mut transition);
+        if let Some(previous_id) = previous_id {
+            push_delete_image(&mut transition, self.transport, previous_id);
+        }
+        push_synchronized_transaction(&mut output, self.transport, transition);
         self.active_atlas = Some(image_id);
         self.atlas_dimensions = Some(image.dimensions());
         Ok(output)
@@ -221,37 +259,35 @@ impl Renderer {
             .atlas_dimensions
             .context("Kitty navigation atlas dimensions are missing")?;
         validate_placement(self.transport, dimensions, crop, cols, rows)?;
+        let mut transition = Vec::new();
+        push_atlas_placement(
+            &mut transition,
+            self.transport,
+            image_id,
+            self.anchor_image_id(),
+            crop,
+            cols,
+            rows,
+        );
+        // Refined tiles belong to the old viewport. Kitty/tmux must not render the atlas
+        // placeholder rewrite or tile reclamation separately: doing so briefly exposes the old
+        // full-view atlas (or a mixture of old tiles and the new crop) on every zoom step.
+        self.delete_active_tiles(&mut transition);
         let mut output = Vec::new();
-        push_atlas_placement(&mut output, self.transport, image_id, crop, cols, rows);
-        // Refined tiles belong to the old viewport. Replacing the base first prevents a blank
-        // frame while their terminal-side images are reclaimed.
-        self.delete_active_tiles(&mut output);
+        push_synchronized_transaction(&mut output, self.transport, transition);
         Ok(output)
     }
 
     pub fn encode_tiles(&mut self, tiles: &[RasterTile], reset: bool) -> Result<Vec<Vec<u8>>> {
+        if self.transport == Transport::Tmux && self.active_atlas.is_none() {
+            bail!("cannot place Kitty tiles in tmux before the relative-placement anchor");
+        }
         let mut output = Vec::new();
         let mut stale_tiles = reset.then(|| std::mem::take(&mut self.active_tiles));
         for tile in tiles {
             let mut transaction = Vec::new();
             if tile.index > MAX_TILE_INDEX {
                 bail!("Kitty tile index {} exceeds {MAX_TILE_INDEX}", tile.index);
-            }
-            if self.transport == Transport::Tmux {
-                if usize::from(tile.rows) > DIACRITIC_COUNT {
-                    bail!(
-                        "Kitty placeholder supports at most {} rows per tile, got {}",
-                        DIACRITIC_COUNT,
-                        tile.rows
-                    );
-                }
-                if usize::from(tile.cols) > DIACRITIC_COUNT {
-                    bail!(
-                        "Kitty placeholder supports at most {} columns per tile, got {}",
-                        DIACRITIC_COUNT,
-                        tile.cols
-                    );
-                }
             }
             let previous_id = stale_tiles
                 .as_mut()
@@ -268,6 +304,7 @@ impl Renderer {
                 &mut transaction,
                 self.transport,
                 image_id,
+                self.anchor_image_id(),
                 tile,
                 previous_id,
             );
@@ -301,10 +338,18 @@ impl Renderer {
 
     fn delete_active_images(&mut self, output: &mut Vec<Vec<u8>>) {
         self.delete_active_tiles(output);
-        if self.active_atlas.take().is_some() {
+        let had_atlas = self.active_atlas.take().is_some();
+        if had_atlas {
             for offset in ATLAS_IMAGE_OFFSETS {
                 push_delete_image(output, self.transport, self.image_id_base + offset);
             }
+        }
+        if had_atlas && self.transport == Transport::Tmux {
+            push_delete_image(
+                output,
+                self.transport,
+                self.image_id_base + ANCHOR_IMAGE_OFFSET,
+            );
         }
         self.atlas_dimensions = None;
     }
@@ -315,10 +360,146 @@ impl Renderer {
             push_delete_image(output, self.transport, image_id);
         }
     }
+
+    fn anchor_image_id(&self) -> Option<u32> {
+        (self.transport == Transport::Tmux).then_some(self.image_id_base + ANCHOR_IMAGE_OFFSET)
+    }
+}
+
+/// Developer-only visual fixture used by `scripts/visual-regression.sh`.
+///
+/// It first displays a solid magenta refined tile over a four-quadrant navigation atlas. Pressing
+/// `+` switches to the solid red top-left atlas crop. A correct atomic transition can only show
+/// magenta or red, never the complete four-quadrant atlas, a blank frame, or a partially updated
+/// grid.
+pub fn run_visual_fixture(segment_delay: Duration) -> Result<()> {
+    let mut terminal = FixtureTerminal::enter()?;
+    let (cols, rows) = crossterm::terminal::size()?;
+    if cols == 0 || rows == 0 {
+        bail!("visual fixture needs a non-empty terminal");
+    }
+
+    let mut renderer = match Selection::select(GraphicsMode::Kitty)? {
+        Selection::Kitty(renderer) => renderer,
+        Selection::Ansi { reason } => bail!(
+            "visual fixture requires Kitty graphics{}",
+            reason.map_or_else(String::new, |reason| format!(": {reason}"))
+        ),
+    };
+    let atlas = RgbImage::from_fn(400, 240, |x, y| match (x < 200, y < 120) {
+        (true, true) => image::Rgb([224, 32, 32]),
+        (false, true) => image::Rgb([32, 224, 32]),
+        (true, false) => image::Rgb([32, 32, 224]),
+        (false, false) => image::Rgb([224, 224, 32]),
+    });
+    terminal.write_segments(
+        renderer.encode_atlas(
+            &atlas,
+            ViewportRect {
+                x: 0,
+                y: 0,
+                width: atlas.width(),
+                height: atlas.height(),
+            },
+            cols,
+            rows,
+        )?,
+        segment_delay,
+    )?;
+    terminal.write_segments(
+        renderer.encode_tiles(
+            &[RasterTile {
+                image: RgbImage::from_pixel(400, 240, image::Rgb([224, 32, 224])),
+                index: 0,
+                col: 0,
+                row: 0,
+                cols,
+                rows,
+            }],
+            false,
+        )?,
+        segment_delay,
+    )?;
+
+    loop {
+        match event::read().context("cannot read visual fixture input")? {
+            Event::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && matches!(key.code, KeyCode::Char('+') | KeyCode::Char('=')) =>
+            {
+                terminal.write_segments(
+                    renderer.encode_atlas_placement(
+                        ViewportRect {
+                            x: 0,
+                            y: 0,
+                            width: atlas.width() / 2,
+                            height: atlas.height() / 2,
+                        },
+                        cols,
+                        rows,
+                    )?,
+                    segment_delay,
+                )?;
+            }
+            Event::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) =>
+            {
+                terminal.write_segments(renderer.encode_delete(), Duration::ZERO)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+struct FixtureTerminal {
+    stdout: io::Stdout,
+}
+
+impl FixtureTerminal {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("cannot enable raw mode for visual fixture")?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            Hide,
+            crossterm::terminal::DisableLineWrap,
+            Clear(ClearType::All),
+        ) {
+            let _ = disable_raw_mode();
+            return Err(error).context("cannot initialize visual fixture terminal");
+        }
+        Ok(Self { stdout })
+    }
+
+    fn write_segments(&mut self, segments: Vec<Vec<u8>>, delay: Duration) -> Result<()> {
+        for segment in segments {
+            self.stdout.write_all(&segment)?;
+            self.stdout.flush()?;
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FixtureTerminal {
+    fn drop(&mut self) {
+        let _ = execute!(
+            self.stdout,
+            crossterm::terminal::EnableLineWrap,
+            Show,
+            LeaveAlternateScreen
+        );
+        let _ = disable_raw_mode();
+    }
 }
 
 fn validate_placement(
-    transport: Transport,
+    _transport: Transport,
     dimensions: (u32, u32),
     crop: ViewportRect,
     cols: u16,
@@ -334,18 +515,24 @@ fn validate_placement(
     if cols == 0 || rows == 0 {
         bail!("Kitty placement must occupy at least one cell");
     }
-    if transport == Transport::Tmux
-        && (usize::from(cols) > DIACRITIC_COUNT || usize::from(rows) > DIACRITIC_COUNT)
-    {
-        bail!(
-            "Kitty Unicode placeholder supports at most {DIACRITIC_COUNT} rows and columns, got {cols}x{rows}"
-        );
-    }
     Ok(())
 }
 
 fn push_delete_image(output: &mut Vec<Vec<u8>>, transport: Transport, image_id: u32) {
     push_apc(output, transport, &format!("a=d,d=I,i={image_id},q=2"), &[]);
+}
+
+fn push_synchronized_transaction(
+    output: &mut Vec<Vec<u8>>,
+    transport: Transport,
+    commands: Vec<Vec<u8>>,
+) {
+    let command_bytes = commands.iter().map(Vec::len).sum::<usize>();
+    let mut transaction = Vec::with_capacity(command_bytes + 64);
+    transaction.extend_from_slice(&encode_passthrough(transport, BEGIN_SYNCHRONIZED_UPDATE));
+    transaction.extend(commands.into_iter().flatten());
+    transaction.extend_from_slice(&encode_passthrough(transport, END_SYNCHRONIZED_UPDATE));
+    output.push(transaction);
 }
 
 fn encode_png(image: &RgbImage) -> Result<String> {
@@ -384,25 +571,20 @@ fn push_atlas_placement(
     output: &mut Vec<Vec<u8>>,
     transport: Transport,
     image_id: u32,
+    anchor_image_id: Option<u32>,
     crop: ViewportRect,
     cols: u16,
     rows: u16,
 ) {
+    let relative = anchor_image_id.map_or_else(String::new, |anchor_image_id| {
+        format!(",P={anchor_image_id},Q={ANCHOR_PLACEMENT_ID},H=0,V=0")
+    });
     let control = format!(
-        "a=p,i={image_id},p={ATLAS_PLACEMENT_ID},x={},y={},w={},h={},c={cols},r={rows},C=1,q=2,z=-1{}",
-        crop.x,
-        crop.y,
-        crop.width,
-        crop.height,
-        if transport == Transport::Tmux {
-            ",U=1"
-        } else {
-            ""
-        },
+        "a=p,i={image_id},p={ATLAS_PLACEMENT_ID},x={},y={},w={},h={},c={cols},r={rows},C=1,q=2,z=-1{relative}",
+        crop.x, crop.y, crop.width, crop.height,
     );
     if transport == Transport::Tmux {
         push_apc(output, transport, &control, &[]);
-        push_placeholders(output, image_id, 0, 0, cols, rows);
     } else {
         let mut command = b"\x1b[1;1H".to_vec();
         command.extend_from_slice(&encode_apc(Transport::Direct, &control, &[]));
@@ -414,22 +596,22 @@ fn push_placement(
     output: &mut Vec<Vec<u8>>,
     transport: Transport,
     image_id: u32,
+    anchor_image_id: Option<u32>,
     tile: &RasterTile,
     previous_id: Option<u32>,
 ) {
+    let relative = anchor_image_id.map_or_else(String::new, |anchor_image_id| {
+        format!(
+            ",P={anchor_image_id},Q={ANCHOR_PLACEMENT_ID},H={},V={}",
+            tile.col, tile.row
+        )
+    });
     let control = format!(
-        "a=p,i={image_id},p={TILE_PLACEMENT_ID},c={},r={},C=1,q=2,z=0{}",
-        tile.cols,
-        tile.rows,
-        if transport == Transport::Tmux {
-            ",U=1"
-        } else {
-            ""
-        },
+        "a=p,i={image_id},p={TILE_PLACEMENT_ID},c={},r={},C=1,q=2,z=0{relative}",
+        tile.cols, tile.rows,
     );
     if transport == Transport::Tmux {
         push_apc(output, transport, &control, &[]);
-        push_placeholders(output, image_id, tile.col, tile.row, tile.cols, tile.rows);
         return;
     }
 
@@ -454,9 +636,21 @@ fn push_placement(
     output.push(command);
 }
 
+fn push_anchor_placement(output: &mut Vec<Vec<u8>>, transport: Transport, image_id: u32) {
+    debug_assert_eq!(transport, Transport::Tmux);
+    push_apc(
+        output,
+        transport,
+        &format!("a=p,i={image_id},p={ANCHOR_PLACEMENT_ID},c=1,r=1,C=1,q=2,z=-2,U=1"),
+        &[],
+    );
+    push_placeholders(output, image_id, ANCHOR_PLACEMENT_ID, 0, 0, 1, 1);
+}
+
 fn push_placeholders(
     output: &mut Vec<Vec<u8>>,
     image_id: u32,
+    placement_id: u32,
     col: u16,
     row: u16,
     cols: u16,
@@ -467,11 +661,14 @@ fn push_placeholders(
     let red = (image_id >> 16) & 0xff;
     let green = (image_id >> 8) & 0xff;
     let blue = image_id & 0xff;
+    let placement_red = (placement_id >> 16) & 0xff;
+    let placement_green = (placement_id >> 8) & 0xff;
+    let placement_blue = placement_id & 0xff;
     for relative_row in 0..rows {
         let mut line = Vec::new();
         write!(
             line,
-            "\x1b[{};{}H\x1b[38;2;{red};{green};{blue}m",
+            "\x1b[{};{}H\x1b[38;2;{red};{green};{blue};58;2;{placement_red};{placement_green};{placement_blue}m",
             u32::from(row) + u32::from(relative_row) + 1,
             u32::from(col) + 1,
         )
@@ -513,6 +710,11 @@ fn detect_transport() -> Result<Transport> {
         let terminal = tmux_client_terminal()?;
         if !supports_kitty_graphics(&terminal) {
             bail!("tmux client terminal {terminal:?} is not known to support Kitty graphics");
+        }
+        if !supports_relative_placements(&terminal) {
+            bail!(
+                "tmux client terminal {terminal:?} does not advertise Kitty relative placements; use --graphics ansi"
+            );
         }
         return Ok(Transport::Tmux);
     }
@@ -563,6 +765,10 @@ fn supports_kitty_graphics(value: &str) -> bool {
     value.contains("kitty") || value.contains("wezterm") || value.contains("ghostty")
 }
 
+fn supports_relative_placements(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("kitty")
+}
+
 fn push_apc(output: &mut Vec<Vec<u8>>, transport: Transport, control: &str, payload: &[u8]) {
     output.push(encode_apc(transport, control, payload));
 }
@@ -592,6 +798,24 @@ fn encode_apc(transport: Transport, control: &str, payload: &[u8]) -> Vec<u8> {
     }
 }
 
+fn encode_passthrough(transport: Transport, command: &[u8]) -> Vec<u8> {
+    match transport {
+        Transport::Direct => command.to_vec(),
+        Transport::Tmux => {
+            let mut wrapped = Vec::with_capacity(command.len() + 16);
+            wrapped.extend_from_slice(b"\x1bPtmux;");
+            for &byte in command {
+                if byte == 0x1b {
+                    wrapped.push(0x1b);
+                }
+                wrapped.push(byte);
+            }
+            wrapped.extend_from_slice(b"\x1b\\");
+            wrapped
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +830,8 @@ mod tests {
         assert!(supports_kitty_graphics("WezTerm"));
         assert!(supports_kitty_graphics("ghostty"));
         assert!(!supports_kitty_graphics("xterm-256color"));
+        assert!(supports_relative_placements("xterm-kitty"));
+        assert!(!supports_relative_placements("WezTerm"));
     }
 
     #[test]
@@ -708,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_frames_use_virtual_placements_and_unicode_placeholders() {
+    fn tmux_tiles_are_relative_to_one_unicode_placeholder_anchor() {
         let mut renderer = Renderer {
             transport: Transport::Tmux,
             image_id_base: 0x12_3456,
@@ -725,27 +951,27 @@ mod tests {
             cols: 2,
             rows: 2,
         };
+        renderer
+            .encode_atlas(
+                &RgbImage::new(4, 4),
+                ViewportRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                4,
+                4,
+            )
+            .unwrap();
         let encoded =
             String::from_utf8(flatten(renderer.encode_tiles(&[tile], false).unwrap())).unwrap();
-        assert!(encoded.contains("U=1"));
-        assert!(encoded.contains("a=p,i=1193046,p=1,c=2,r=2,C=1,q=2,z=0,U=1"));
-        assert!(encoded.contains("\x1b[5;4H\x1b[38;2;18;52;86m"));
+        assert!(!encoded.contains("U=1"));
         assert!(encoded.contains(&format!(
-            "{PLACEHOLDER}{}{}",
-            diacritic(0).unwrap(),
-            diacritic(0).unwrap()
+            "a=p,i=1193046,p=1,c=2,r=2,C=1,q=2,z=0,P={},Q=3,H=3,V=4",
+            0x12_3456 + ANCHOR_IMAGE_OFFSET
         )));
-        assert!(encoded.contains(&format!(
-            "{PLACEHOLDER}{}{}",
-            diacritic(0).unwrap(),
-            diacritic(1).unwrap()
-        )));
-        assert!(encoded.contains(&format!(
-            "{PLACEHOLDER}{}{}",
-            diacritic(1).unwrap(),
-            diacritic(1).unwrap()
-        )));
-        assert_eq!(encoded.matches(PLACEHOLDER).count(), 4);
+        assert_eq!(encoded.matches(PLACEHOLDER).count(), 0);
     }
 
     #[test]
@@ -852,7 +1078,113 @@ mod tests {
     }
 
     #[test]
-    fn tmux_atlas_placeholders_support_a_240_column_pane() {
+    fn direct_atlas_preview_atomically_replaces_refined_tiles() {
+        let mut renderer = Renderer {
+            transport: Transport::Direct,
+            image_id_base: 7,
+            active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
+            active_atlas: None,
+            atlas_dimensions: None,
+        };
+        renderer
+            .encode_atlas(
+                &RgbImage::new(4, 4),
+                ViewportRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                2,
+                2,
+            )
+            .unwrap();
+        renderer
+            .encode_tiles(
+                &[RasterTile {
+                    image: RgbImage::new(4, 4),
+                    index: 0,
+                    col: 0,
+                    row: 0,
+                    cols: 2,
+                    rows: 2,
+                }],
+                false,
+            )
+            .unwrap();
+
+        let segments = renderer
+            .encode_atlas_placement(
+                ViewportRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                2,
+                2,
+            )
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        let transition = &segments[0];
+        assert!(transition.starts_with(BEGIN_SYNCHRONIZED_UPDATE));
+        assert!(transition.ends_with(END_SYNCHRONIZED_UPDATE));
+        let encoded = String::from_utf8_lossy(transition);
+        let placement = encoded.find("x=0,y=0,w=2,h=2").unwrap();
+        let deletion = encoded.find("a=d,d=I,i=7").unwrap();
+        assert!(placement < deletion);
+    }
+
+    #[test]
+    fn tmux_atlas_preview_passes_one_synchronized_transaction_to_kitty() {
+        let mut renderer = Renderer {
+            transport: Transport::Tmux,
+            image_id_base: 7,
+            active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
+            active_atlas: None,
+            atlas_dimensions: None,
+        };
+        renderer
+            .encode_atlas(
+                &RgbImage::new(4, 4),
+                ViewportRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                2,
+                2,
+            )
+            .unwrap();
+
+        let segments = renderer
+            .encode_atlas_placement(
+                ViewportRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                2,
+                2,
+            )
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        let begin = encode_passthrough(Transport::Tmux, BEGIN_SYNCHRONIZED_UPDATE);
+        let end = encode_passthrough(Transport::Tmux, END_SYNCHRONIZED_UPDATE);
+        assert!(segments[0].starts_with(&begin));
+        assert!(segments[0].ends_with(&end));
+        let encoded = String::from_utf8_lossy(&segments[0]);
+        assert_eq!(encoded.matches(PLACEHOLDER).count(), 0);
+        assert!(encoded.contains("x=0,y=0,w=2,h=2"));
+        assert!(encoded.contains("P=8196,Q=3,H=0,V=0"));
+    }
+
+    #[test]
+    fn tmux_atlas_uses_one_anchor_even_in_a_240_column_pane() {
         let mut renderer = Renderer {
             transport: Transport::Tmux,
             image_id_base: 7,
@@ -876,12 +1208,14 @@ mod tests {
             )
             .unwrap();
         let encoded = String::from_utf8(flatten(encoded)).unwrap();
-        assert_eq!(encoded.matches(PLACEHOLDER).count(), 240);
+        assert_eq!(encoded.matches(PLACEHOLDER).count(), 1);
+        assert!(encoded.contains(";58;2;0;0;3m"));
         assert!(encoded.contains(&format!(
             "{PLACEHOLDER}{}{}",
             diacritic(0).unwrap(),
-            diacritic(239).unwrap()
+            diacritic(0).unwrap()
         )));
+        assert!(encoded.contains("c=240,r=1,C=1,q=2,z=-1,P=8196,Q=3,H=0,V=0"));
     }
 
     #[test]

@@ -96,10 +96,20 @@ enum Command {
         #[arg(long, default_value_t = 40.0, value_name = "MBPS")]
         tmux_bandwidth_mbps: f64,
     },
+    /// Render a deterministic Kitty transition for automated visual regression tests.
+    #[command(hide = true)]
+    GraphicsFixture {
+        /// Deliberately pause after protocol queue segments to expose non-atomic transitions.
+        #[arg(long, default_value_t = 20)]
+        segment_delay_ms: u64,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Command::GraphicsFixture { segment_delay_ms }) = cli.command.as_ref() {
+        return kitty::run_visual_fixture(Duration::from_millis(*segment_delay_ms));
+    }
     let config = config::load(cli.config.as_deref())?;
     let discovered = discovery::discover(cli.niri_socket.as_deref())?;
 
@@ -137,6 +147,9 @@ fn main() -> Result<()> {
                 actions: config.actions,
             },
         ),
+        Command::GraphicsFixture { .. } => {
+            unreachable!("graphics fixture returned before discovery")
+        }
     }
 }
 

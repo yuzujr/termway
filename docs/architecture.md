@@ -22,7 +22,7 @@ macOS terminal
 ```text
 src/
   viewer.rs      状态机、TTY 生命周期、输出调度、坐标映射
-  kitty.rs       Kitty transport、tile、atlas、tmux placeholders
+  kitty.rs       Kitty transport、tile、atlas、tmux relative placements
   render.rs      half-block、cell diff、raster/viewport/tile
   screencopy.rs  wlr-screencopy session 与 buffer 复用
   capture.rs     damage watcher、原生捕获与 grim fallback
@@ -56,8 +56,9 @@ ANSI 重绘采用以下策略：
 - 连续 cell 复用 ANSI 颜色状态，damage 帧只发送变化 run。
 
 Kitty 模式缓存 1080p navigation atlas，zoom/pan 只发送 source-crop placement；120ms idle
-后用 128px cell-aligned tile refine。tmux 路径使用完整 Unicode placeholder 坐标、限制
-输出 burst，并按配置带宽和实际 PNG 大小选择 1080p–360p；静止后逐档恢复。
+后用 128px cell-aligned tile refine。tmux 路径用单个 Unicode placeholder 建立 pane 锚点，
+atlas/tile 通过 relative placement 定位；crop 切换以 synchronized update 原子提交。输出
+仍限制 burst，并按配置带宽和实际 PNG 大小选择 1080p–360p；静止后逐档恢复。
 
 ### Control mode
 

@@ -120,7 +120,7 @@ ext-image-copy-capture。termway 首版 client 绑定兼容的 screencopy v1，�
 - resize、切 pane、detach/attach 后不残留图片。
 
 当前实现包含 1080p terminal-side navigation atlas、source-crop 即时 zoom/pan、延迟 tile
-refine、tmux Unicode placeholders、稳定双缓冲 tile、带宽 pacing 和 1080p–360p 自适应
+refine、tmux 单锚点 relative placement、稳定双缓冲 tile、带宽 pacing 和 1080p–360p 自适应
 画质。固定 7-bit/channel 预处理最大误差为 1/255，可显著减少 PNG。无法使用 Kitty 时
 `auto` 自动回退到带 cell diff 的 ANSI half-block。
 

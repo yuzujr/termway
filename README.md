@@ -69,8 +69,7 @@ ANSI 编码器会在连续 cell 间复用前景/背景色状态并把同时变�
 后台 watcher 只保留最新帧，慢速渲染期间到达的旧帧会被覆盖。手动刷新使用立即完成的 capture，不会被
 `copy_with_damage` 的等待语义阻塞。
 
-viewer 默认使用 `--graphics auto`。如果直连终端或 tmux 的实际 client 是 Kitty、WezTerm
-或 Ghostty，并且 tmux 开启了 `allow-passthrough`，termway 会使用
+viewer 默认使用 `--graphics auto`。直连 Kitty、WezTerm 或 Ghostty 时会尝试
 [Kitty Graphics Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)：viewport 的传输
 分辨率最高为 1920×1080，但 placement 仍按原始宽高比铺满 terminal pane。画面按 terminal
 cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使用双缓冲 image ID 完整
@@ -78,9 +77,11 @@ cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使�
 整帧会先归一到 terminal cell 的精确宽高比，避免各 tile 独立缩放产生接缝；每个 tile 使用
 完整协议单元无空窗替换。首次显示会在 terminal 内缓存一张全屏 navigation atlas；缩放和
 平移立即通过 Kitty 的 source crop 重新 placement，不重新缩放、编码或传输像素，输入停止
-120ms 后再用高分辨率 tile 覆盖预览。tmux 下使用 Unicode placeholders；每个 placeholder
-cell 都携带完整的 tile 行列坐标，内置完整 297 项 diacritic 表以支持宽 pane，不依赖 tmux
-局部重绘时无法保证的左邻 cell 推导。因此图片位置和 pane 坐标由 tmux 正常管理。
+120ms 后再用高分辨率 tile 覆盖预览。tmux 下只写一个 Unicode placeholder 作为 pane
+左上角锚点，atlas 和 tile 都使用 Kitty relative placement 挂到该锚点；zoom/pan 因而只需
+更新真正支持 source crop 的普通 placement，不会重写整屏 placeholder，也不会短暂退回 1×
+原图。atlas crop、旧 tile 回收和锚点变更放在同一个 DEC synchronized update 中提交。
+图片位置仍随 tmux 的 pane 和 resize 正常移动。
 modeline 会在 crop 阶段显示 `GFX:KITTY/PREVIEW`，refine 后显示实际档位（例如
 `GFX:KITTY/720p`）；ANSI 则显示 `GFX:ANSI`。
 
@@ -126,6 +127,10 @@ tmux 至少需要：
 ```tmux
 set -g allow-passthrough on
 ```
+
+tmux 图形路径目前要求实际 client 为 Kitty 0.31+（relative placement 在 0.31 加入）；其他
+client 在 `auto` 模式下安全回退到 ANSI，避免声称支持基础 Kitty Graphics、实际却无法实现
+无像素重传的 source-crop navigation。
 
 交互查看器默认从 1× 全景打开：
 
