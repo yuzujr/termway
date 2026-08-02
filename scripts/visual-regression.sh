@@ -17,7 +17,7 @@ if [[ -z $wayland_display ]]; then
     exit 2
 fi
 
-for command in cargo grim jq kitty magick niri tmux; do
+for command in awk cargo cmp grim jq kitty magick niri tmux; do
     if ! command -v "$command" >/dev/null; then
         echo "visual regression: missing command: $command" >&2
         exit 2
@@ -139,6 +139,73 @@ run_case() {
     echo "visual regression: $mode passed"
 }
 
+run_quality_case() {
+    local socket="$temporary_dir/quality.sock"
+    local log="$artifact_dir/quality-kitty.log"
+    local tmux_server="termway-visual-$PPID-quality"
+    kitty_sockets+=("$socket")
+    tmux_servers+=("$tmux_server")
+    WAYLAND_DISPLAY="$wayland_display" kitty --detach --start-as=fullscreen \
+        --detached-log="$log" --listen-on="unix:$socket" \
+        -o allow_remote_control=yes --class termway-vtest --title termway-visual-quality \
+        tmux -L "$tmux_server" -f /dev/null new-session \
+        "tmux set-option -g allow-passthrough all; exec '$binary' quality-fixture --tmux-bandwidth-mbps 40"
+    wait_for_kitty "$socket"
+    sleep 3
+
+    local step
+    for step in $(seq 1 7); do
+        kitty @ --to "unix:$socket" send-key --match all plus
+    done
+    sleep 2
+
+    kitty @ --to "unix:$socket" send-key --match all 0
+    local attempt screen_text=""
+    for attempt in $(seq 1 100); do
+        screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
+        if [[ $screen_text == *'1.00x'* && $screen_text == *'KITTY/PREVIEW'* ]]; then
+            break
+        fi
+        sleep 0.01
+    done
+    if [[ $screen_text != *'1.00x'* || $screen_text != *'KITTY/PREVIEW'* ]]; then
+        echo "visual regression: quality fixture did not reach the 1x atlas preview" >&2
+        return 1
+    fi
+
+    local preview="$artifact_dir/quality-preview.png"
+    local final="$artifact_dir/quality-final.png"
+    XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
+        WAYLAND_DISPLAY="$wayland_display" grim -o "$output_name" "$preview"
+    sleep 2
+    XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
+        WAYLAND_DISPLAY="$wayland_display" grim -o "$output_name" "$final"
+    screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen)
+    if [[ $screen_text != *'1.00x'* || $screen_text != *'GFX:KITTY/1080p'* ]]; then
+        echo "visual regression: quality fixture did not settle at the full-resolution atlas" >&2
+        return 1
+    fi
+
+    magick "$preview" -crop '100%x85%+0+0' +repage "$artifact_dir/quality-preview-image.png"
+    magick "$final" -crop '100%x85%+0+0' +repage "$artifact_dir/quality-final-image.png"
+    local contrast
+    contrast=$(magick "$artifact_dir/quality-preview-image.png" -format '%[fx:standard_deviation]' info:)
+    if ! awk -v contrast="$contrast" 'BEGIN { exit !(contrast > 0.20) }'; then
+        echo "visual regression: quality fixture image is missing or lacks test detail" >&2
+        return 1
+    fi
+    if ! cmp -s "$artifact_dir/quality-preview-image.png" "$artifact_dir/quality-final-image.png"; then
+        echo "visual regression: the delayed refine degraded the 1x atlas" >&2
+        return 1
+    fi
+    magick "$preview" "$final" -thumbnail 512x320 -gravity center -extent 512x320 \
+        +append "$artifact_dir/quality-montage.png"
+    kitty @ --to "unix:$socket" send-key --match all q >/dev/null 2>&1 || true
+    sleep 0.2
+    echo "visual regression: tmux quality monotonicity passed"
+}
+
 run_case direct
 run_case tmux
+run_quality_case
 echo "visual regression: artifacts saved in $artifact_dir"

@@ -103,12 +103,24 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         segment_delay_ms: u64,
     },
+    /// Exercise the production Kitty atlas/refine quality path with a static test image.
+    #[command(hide = true)]
+    QualityFixture {
+        #[arg(long, default_value_t = 40.0, value_name = "MBPS")]
+        tmux_bandwidth_mbps: f64,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(Command::GraphicsFixture { segment_delay_ms }) = cli.command.as_ref() {
         return kitty::run_visual_fixture(Duration::from_millis(*segment_delay_ms));
+    }
+    if let Some(Command::QualityFixture {
+        tmux_bandwidth_mbps,
+    }) = cli.command.as_ref()
+    {
+        return viewer::run_quality_fixture(*tmux_bandwidth_mbps);
     }
     let config = config::load(cli.config.as_deref())?;
     let discovered = discovery::discover(cli.niri_socket.as_deref())?;
@@ -149,6 +161,9 @@ fn main() -> Result<()> {
         ),
         Command::GraphicsFixture { .. } => {
             unreachable!("graphics fixture returned before discovery")
+        }
+        Command::QualityFixture { .. } => {
+            unreachable!("quality fixture returned before discovery")
         }
     }
 }

@@ -82,6 +82,9 @@ cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使�
 更新真正支持 source crop 的普通 placement，不会重写整屏 placeholder，也不会短暂退回 1×
 原图。atlas crop、旧 tile 回收和锚点变更放在同一个 DEC synchronized update 中提交。
 图片位置仍随 tmux 的 pane 和 resize 正常移动。
+refine 还遵守单调画质约束：fresh atlas crop 的有效像素数如果不低于带宽自适应后的 raster，
+就保留 atlas，不允许 720p/540p/360p tile 反向覆盖成更模糊的画面；atlas 已因 desktop damage
+过期时则优先显示较低分辨率的新内容，并在静止后刷新高质量 atlas。
 modeline 会在 crop 阶段显示 `GFX:KITTY/PREVIEW`，refine 后显示实际档位（例如
 `GFX:KITTY/720p`）；ANSI 则显示 `GFX:ANSI`。
 
@@ -99,8 +102,9 @@ tmux 下的 refined frame 以约 275ms 为单帧传输预算；默认 40 Mbit/s 
 超大帧塞进 tmux；modeline 显示当前档位。画面静止 2 秒后逐档恢复，避免动画期间反复抖动，
 同时让停止后的文字自动回到最高精度。navigation atlas 始终保留清晰的 1080p 全局预览。
 
-Kitty 协议输出使用非阻塞 PTY 和完整协议事务队列。一个 128×128 tile 的所有 chunk 和
-placement 作为不可拆分事务，满足协议“不在 `m=1` 上传中插入其他图形命令”的要求；控制
+Kitty 协议输出使用非阻塞 PTY 和完整协议事务队列。一张 atlas 或一个 128×128 tile 的所有
+chunk 都作为不可拆分上传事务，tile placement 也包含在同一事务中，满足协议“不在 `m=1`
+上传中插入其他图形命令”的要求；这也避免 resize 丢弃 atlas 的后续 chunk。控制
 最多等待当前 tile（最坏的无损 RGB 数据经 base64 后约 66 KiB），不会等待整帧。上一帧仍在
 发送时不会继续堆积 damage 帧，只记录一次最新画面重绘请求。modeline、echo 和输入状态输出
 优先于后续图像事务，退出时最多补完当前协议事务，随后

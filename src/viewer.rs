@@ -67,6 +67,71 @@ pub struct RunOptions<'a> {
     pub environment: &'a [(OsString, OsString)],
 }
 
+/// Developer-only end-to-end fixture for the Kitty atlas/refine quality policy.
+pub fn run_quality_fixture(tmux_bandwidth_mbps: f64) -> Result<()> {
+    let frame = RgbImage::from_fn(2560, 1600, |x, y| {
+        if (x / 6 + y / 6) % 2 == 0 {
+            image::Rgb([240, 240, 240])
+        } else {
+            image::Rgb([16, 24, 40])
+        }
+    });
+    let mut state = ViewerState::new(Viewport::default(), false)?;
+    let mut terminal = Terminal::enter(GraphicsMode::Kitty, tmux_bandwidth_mbps)?;
+    state.graphics_backend = terminal.backend_name();
+    let mut layout = terminal.draw(&frame, "quality-fixture", &state)?;
+
+    loop {
+        let output_progress = terminal.pump_output()?;
+        if terminal.take_deferred_redraw() {
+            layout = terminal.draw(&frame, "quality-fixture", &state)?;
+        }
+        let timeout = terminal.next_wakeup_timeout();
+        let timeout = if terminal.has_pending_output() {
+            let retry = if output_progress {
+                Duration::ZERO
+            } else {
+                OUTPUT_RETRY_INTERVAL
+            };
+            Some(timeout.map_or(retry, |timeout| timeout.min(retry)))
+        } else {
+            timeout
+        };
+        if let Some(timeout) = timeout
+            && !event::poll(timeout).context("cannot poll quality fixture input")?
+        {
+            if terminal.take_due_refine() {
+                layout = terminal.draw(&frame, "quality-fixture", &state)?;
+            }
+            continue;
+        }
+
+        match event::read().context("cannot read quality fixture input")? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if key.code == KeyCode::Char('0') {
+                    // Deterministically reproduce the result of tmux's bandwidth adaptation:
+                    // returning to 1x must not let a 360p candidate cover a fresh 1080p atlas.
+                    terminal.kitty_quality.tier = KITTY_QUALITY_HEIGHTS.len() - 1;
+                    terminal.kitty_quality_upgrade_at = None;
+                }
+                match state.handle_key(key) {
+                    Effect::Quit => return Ok(()),
+                    Effect::Redraw => {
+                        layout = terminal.draw(&frame, "quality-fixture", &state)?;
+                    }
+                    Effect::Chrome => terminal.draw_chrome("quality-fixture", &state, layout)?,
+                    _ => {}
+                }
+            }
+            Event::Resize(_, _) => {
+                terminal.invalidate_image();
+                layout = terminal.draw(&frame, "quality-fixture", &state)?;
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn run(
     runtime_dir: &Path,
     wayland_display: &str,
@@ -142,6 +207,10 @@ pub fn run(
                         state.cancel_auto_refresh();
                         terminal.note_visible_damage();
                         layout = terminal.draw(&frame, output_name, &state)?;
+                    } else {
+                        // The navigation atlas covers the entire output, not only the current
+                        // zoomed viewport. Damage outside the viewport still makes it stale.
+                        terminal.note_frame_damage();
                     }
                 }
                 Ok(None) => {}
@@ -192,6 +261,7 @@ pub fn run(
                     match capturer.capture() {
                         Ok(new_frame) => {
                             frame = new_frame;
+                            terminal.note_visible_damage();
                             layout = terminal.draw(&frame, output_name, &state)?;
                         }
                         Err(error) => {
@@ -215,6 +285,7 @@ pub fn run(
                         let refreshed = match capturer.capture() {
                             Ok(new_frame) => {
                                 frame = new_frame;
+                                terminal.note_visible_damage();
                                 state.message("Refreshed frame");
                                 true
                             }
@@ -367,6 +438,7 @@ pub fn run(
                         continue;
                     }
                     if frame_changed {
+                        terminal.note_visible_damage();
                         layout = terminal.draw(&frame, output_name, &state)?;
                     } else {
                         terminal.draw_echo(&state)?;
@@ -1379,11 +1451,15 @@ impl Terminal {
         refine_due || upgrade_due || atlas_due
     }
 
-    fn note_visible_damage(&mut self) {
+    fn note_frame_damage(&mut self) {
         self.kitty_atlas_stale = true;
         if self.kitty_layout.is_some_and(DrawLayout::is_full_viewport) {
             self.kitty_atlas_refresh_at = Some(Instant::now() + KITTY_ATLAS_REFRESH_DELAY);
         }
+    }
+
+    fn note_visible_damage(&mut self) {
+        self.note_frame_damage();
         if !self.kitty_quality.is_maximum() {
             self.kitty_quality_upgrade_at = Some(Instant::now() + KITTY_QUALITY_RECOVERY_DELAY);
         }
@@ -1622,12 +1698,21 @@ impl Terminal {
             return Ok(layout);
         }
 
+        let atlas_crop = self.kitty_atlas.as_ref().map(|atlas| {
+            render::map_viewport_to_raster(
+                layout.viewport,
+                atlas.source_width,
+                atlas.source_height,
+                atlas.image_width,
+                atlas.image_height,
+            )
+        });
         let previous_layout = self
             .last_kitty_image
             .as_ref()
             .map(|previous| previous.layout);
         let mut quality_reduced = false;
-        let (raster, mut segments) = loop {
+        let (raster, mut segments, candidate) = loop {
             let (quality_width, quality_height) = self.kitty_quality.limits();
             let mut raster = render::render_raster_viewport(
                 frame,
@@ -1646,6 +1731,13 @@ impl Terminal {
                 quality_height,
             );
             render::reduce_color_precision(&mut raster.image, KITTY_COLOR_BITS);
+            if !refine_improves_atlas(
+                self.kitty_atlas_stale,
+                atlas_crop,
+                raster.image.dimensions(),
+            ) {
+                break (raster, Vec::new(), None);
+            }
             let previous = self.last_kitty_image.as_ref().filter(|previous| {
                 previous.layout == layout
                     && previous.image.dimensions() == raster.image.dimensions()
@@ -1677,9 +1769,25 @@ impl Terminal {
                 quality_reduced = true;
                 continue;
             }
-            *self.kitty.as_mut().expect("Kitty renderer was selected") = candidate;
-            break (raster, segments);
+            break (raster, segments, Some(candidate));
         };
+        let Some(candidate) = candidate else {
+            // A fresh terminal-side atlas is already at least as detailed as this bandwidth-
+            // limited raster. Do not encode or let a nominal "refine" replace it with blurrier
+            // tiles.
+            self.kitty_quality.reset();
+            self.kitty_quality_upgrade_at = None;
+            self.last_image = None;
+            self.last_kitty_image = None;
+            self.kitty_layout = Some(layout);
+            self.kitty_refine_at = None;
+            self.kitty_previewing = false;
+            self.force_kitty_redraw = false;
+            self.deferred_kitty_redraw = false;
+            self.draw_chrome(output_name, state, layout)?;
+            return Ok(layout);
+        };
+        *self.kitty.as_mut().expect("Kitty renderer was selected") = candidate;
         if quality_reduced {
             self.kitty_quality_upgrade_at = Some(Instant::now() + KITTY_QUALITY_RECOVERY_DELAY);
         }
@@ -2085,6 +2193,21 @@ impl KittyQuality {
             true
         }
     }
+}
+
+fn refine_improves_atlas(
+    atlas_stale: bool,
+    atlas_crop: Option<ViewportRect>,
+    raster_dimensions: (u32, u32),
+) -> bool {
+    if atlas_stale {
+        return true;
+    }
+    let Some(atlas_crop) = atlas_crop else {
+        return true;
+    };
+    u64::from(raster_dimensions.0) * u64::from(raster_dimensions.1)
+        > u64::from(atlas_crop.width) * u64::from(atlas_crop.height)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2863,5 +2986,20 @@ mod tests {
         let mut moderate = KittyQuality::default();
         assert!(moderate.reduce_for(1_500_000, 1_100_000));
         assert_eq!(moderate.label(), "900p");
+    }
+
+    #[test]
+    fn fresh_atlas_is_never_overlaid_with_an_equal_or_lower_resolution_refine() {
+        let crop = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 960,
+            height: 540,
+        };
+        assert!(!refine_improves_atlas(false, Some(crop), (640, 360)));
+        assert!(!refine_improves_atlas(false, Some(crop), (960, 540)));
+        assert!(refine_improves_atlas(false, Some(crop), (1280, 720)));
+        assert!(refine_improves_atlas(true, Some(crop), (640, 360)));
+        assert!(refine_improves_atlas(false, None, (640, 360)));
     }
 }

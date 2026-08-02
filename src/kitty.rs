@@ -210,16 +210,16 @@ impl Renderer {
         let anchor_ready = previous_id.is_some();
         let mut output = Vec::new();
         if self.transport == Transport::Tmux && !anchor_ready {
-            push_upload(
+            push_upload_transaction(
                 &mut output,
                 self.transport,
                 self.image_id_base + ANCHOR_IMAGE_OFFSET,
                 &RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0])),
             )?;
         }
-        push_upload(&mut output, self.transport, image_id, image)?;
+        push_upload_transaction(&mut output, self.transport, image_id, image)?;
         let mut transition = Vec::new();
-        if self.transport == Transport::Tmux && !anchor_ready {
+        if self.transport == Transport::Tmux {
             push_anchor_placement(
                 &mut transition,
                 self.transport,
@@ -564,6 +564,18 @@ fn push_upload(
         };
         push_apc(output, transport, &control, chunk);
     }
+    Ok(())
+}
+
+fn push_upload_transaction(
+    output: &mut Vec<Vec<u8>>,
+    transport: Transport,
+    image_id: u32,
+    image: &RgbImage,
+) -> Result<()> {
+    let mut chunks = Vec::new();
+    push_upload(&mut chunks, transport, image_id, image)?;
+    output.push(chunks.into_iter().flatten().collect());
     Ok(())
 }
 
@@ -934,6 +946,41 @@ mod tests {
     }
 
     #[test]
+    fn atlas_upload_chunks_form_one_non_cancellable_protocol_transaction() {
+        let mut renderer = Renderer {
+            transport: Transport::Direct,
+            image_id_base: 7,
+            active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
+            active_atlas: None,
+            atlas_dimensions: None,
+        };
+        let image = RgbImage::from_fn(256, 256, |x, y| {
+            let value = x.wrapping_mul(1_664_525) ^ y.wrapping_mul(1_013_904_223);
+            image::Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+        });
+        let segments = renderer
+            .encode_atlas(
+                &image,
+                ViewportRect {
+                    x: 0,
+                    y: 0,
+                    width: 256,
+                    height: 256,
+                },
+                32,
+                16,
+            )
+            .unwrap();
+        assert_eq!(segments.len(), 2);
+        let upload = String::from_utf8_lossy(&segments[0]);
+        assert!(upload.matches("m=1").count() > 1);
+        assert!(upload.contains("m=0"));
+        assert!(!upload.contains("a=p"));
+        assert!(segments[1].starts_with(BEGIN_SYNCHRONIZED_UPDATE));
+    }
+
+    #[test]
     fn tmux_tiles_are_relative_to_one_unicode_placeholder_anchor() {
         let mut renderer = Renderer {
             transport: Transport::Tmux,
@@ -1216,6 +1263,37 @@ mod tests {
             diacritic(0).unwrap()
         )));
         assert!(encoded.contains("c=240,r=1,C=1,q=2,z=-1,P=8196,Q=3,H=0,V=0"));
+    }
+
+    #[test]
+    fn tmux_atlas_rebuild_restores_the_screen_anchor_after_resize() {
+        let mut renderer = Renderer {
+            transport: Transport::Tmux,
+            image_id_base: 7,
+            active_tiles: BTreeMap::new(),
+            known_tile_images: BTreeSet::new(),
+            active_atlas: None,
+            atlas_dimensions: None,
+        };
+        let viewport = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        renderer
+            .encode_atlas(&RgbImage::new(4, 4), viewport, 2, 2)
+            .unwrap();
+        let rebuilt = String::from_utf8(flatten(
+            renderer
+                .encode_atlas(&RgbImage::new(4, 4), viewport, 3, 3)
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(rebuilt.matches(PLACEHOLDER).count(), 1);
+        assert!(rebuilt.contains("p=3,c=1,r=1,C=1,q=2,z=-2,U=1"));
+        assert!(rebuilt.contains("c=3,r=3,C=1,q=2,z=-1,P=8196,Q=3"));
+        assert!(!rebuilt.contains("a=t,f=100,t=d,i=8196"));
     }
 
     #[test]
