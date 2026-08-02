@@ -151,6 +151,35 @@ run_quality_case() {
         tmux -L "$tmux_server" -f /dev/null new-session \
         "tmux set-option -g allow-passthrough all; exec '$binary' quality-fixture --tmux-bandwidth-mbps 40"
     wait_for_kitty "$socket"
+
+    local attempt screen_text=""
+    for attempt in $(seq 1 200); do
+        screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
+        if [[ $screen_text == *'1.00x'* ]]; then
+            break
+        fi
+        sleep 0.01
+    done
+    if [[ $screen_text != *'1.00x'* ]]; then
+        echo "visual regression: quality fixture did not initialize" >&2
+        return 1
+    fi
+
+    # The fixture is intentionally hard to compress. A viewport key must still update terminal
+    # chrome between 4 KiB APC chunks instead of waiting behind the complete atlas payload.
+    kitty @ --to "unix:$socket" send-key --match all plus
+    for attempt in $(seq 1 100); do
+        screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
+        if [[ $screen_text == *'1.25x'* ]]; then
+            break
+        fi
+        sleep 0.01
+    done
+    if [[ $screen_text != *'1.25x'* ]]; then
+        echo "visual regression: viewport control was blocked behind the atlas upload" >&2
+        return 1
+    fi
+    kitty @ --to "unix:$socket" send-key --match all minus
     sleep 3
 
     local step
@@ -160,7 +189,7 @@ run_quality_case() {
     sleep 2
 
     kitty @ --to "unix:$socket" send-key --match all 0
-    local attempt screen_text=""
+    screen_text=""
     for attempt in $(seq 1 100); do
         screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
         if [[ $screen_text == *'1.00x'* && $screen_text == *'KITTY/PREVIEW'* ]]; then
@@ -190,7 +219,7 @@ run_quality_case() {
     magick "$final" -crop '100%x85%+0+0' +repage "$artifact_dir/quality-final-image.png"
     local contrast
     contrast=$(magick "$artifact_dir/quality-preview-image.png" -format '%[fx:standard_deviation]' info:)
-    if ! awk -v contrast="$contrast" 'BEGIN { exit !(contrast > 0.20) }'; then
+    if ! awk -v contrast="$contrast" 'BEGIN { exit !(contrast > 0.15) }'; then
         echo "visual regression: quality fixture image is missing or lacks test detail" >&2
         return 1
     fi

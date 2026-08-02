@@ -102,13 +102,15 @@ tmux 下的 refined frame 以约 275ms 为单帧传输预算；默认 40 Mbit/s 
 超大帧塞进 tmux；modeline 显示当前档位。画面静止 2 秒后逐档恢复，避免动画期间反复抖动，
 同时让停止后的文字自动回到最高精度。navigation atlas 始终保留清晰的 1080p 全局预览。
 
-Kitty 协议输出使用非阻塞 PTY 和完整协议事务队列。一张 atlas 或一个 128×128 tile 的所有
-chunk 都作为不可拆分上传事务，tile placement 也包含在同一事务中，满足协议“不在 `m=1`
-上传中插入其他图形命令”的要求；这也避免 resize 丢弃 atlas 的后续 chunk。控制
+Kitty 协议输出使用非阻塞 PTY 和有序协议队列。atlas 的 4 KiB APC chunk 之间允许状态栏等
+普通终端控制插队，因此大图上传时也不会把交互锁死；只要图形队列尚未排空，replacement 就
+保留旧 chunk 后再追加，满足协议“不在 `m=1` 上传中插入其他图形命令”的要求，也避免 resize
+丢弃 atlas 的后续 chunk。一个 128×128 tile 的上传和 placement 仍是完整协议事务。控制
 最多等待当前 tile（最坏的无损 RGB 数据经 base64 后约 66 KiB），不会等待整帧。上一帧仍在
 发送时不会继续堆积 damage 帧，只记录一次最新画面重绘请求。modeline、echo 和输入状态输出
-优先于后续图像事务，退出时最多补完当前协议事务，随后
-丢弃尚未发送的图像，避免低速 tmux/SSH 链路阻塞控制。tmux 会主动吸收 pane PTY 输出、无法
+优先于后续图像事务，退出时最多补完当前 APC chunk（或当前 tile 事务），随后用 delete 中止
+未完成的上传并丢弃尚未发送的图像，避免低速 tmux/SSH 链路阻塞控制。tmux 会主动吸收 pane
+PTY 输出、无法
 把真实 client 背压传回程序，因此 termway 在 tmux 下默认把图像输出平滑限制在 40 Mbit/s、
 只允许 16 KiB burst；控制输出不受此限制，避免它排在 tmux 已缓存的数 MB 图像之后。可按
 实测 SSH 路径调整，例如 50 Mbit/s 链路保守使用：

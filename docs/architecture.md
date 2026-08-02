@@ -59,8 +59,8 @@ Kitty 模式缓存 1080p navigation atlas，zoom/pan 只发送 source-crop place
 后用 128px cell-aligned tile refine。tmux 路径用单个 Unicode placeholder 建立 pane 锚点，
 atlas/tile 通过 relative placement 定位；crop 切换以 synchronized update 原子提交。输出
 仍限制 burst，并按配置带宽和实际 PNG 大小选择 1080p–360p；fresh atlas 上只允许分辨率更高
-的 refine 覆盖，静止后逐档恢复。atlas 的完整 chunk 序列不可取消，resize 只替换其后的
-placement，避免留下未完成的 `m=1` 上传。
+的 refine 覆盖，静止后逐档恢复。atlas 的 4 KiB APC chunk 可独立调度普通终端控制；图形队列
+未排空时保留旧 chunk，再追加 replacement，避免留下未完成的 `m=1` 上传。
 
 ### Control mode
 

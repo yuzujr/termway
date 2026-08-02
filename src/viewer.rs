@@ -70,11 +70,20 @@ pub struct RunOptions<'a> {
 /// Developer-only end-to-end fixture for the Kitty atlas/refine quality policy.
 pub fn run_quality_fixture(tmux_bandwidth_mbps: f64) -> Result<()> {
     let frame = RgbImage::from_fn(2560, 1600, |x, y| {
-        if (x / 6 + y / 6) % 2 == 0 {
-            image::Rgb([240, 240, 240])
-        } else {
-            image::Rgb([16, 24, 40])
-        }
+        // Small deterministic noise blocks keep this fixture visually detailed and, crucially,
+        // expensive to PNG-compress. Flat colors and regular checkerboards made multi-megabyte
+        // output scheduling regressions invisible to the end-to-end test.
+        let block_x = x / 3;
+        let block_y = y / 3;
+        let mut value = block_x.wrapping_mul(0x9e37_79b1)
+            ^ block_y.wrapping_mul(0x85eb_ca77)
+            ^ block_x.wrapping_add(block_y).rotate_left(13);
+        value ^= value >> 16;
+        value = value.wrapping_mul(0x7feb_352d);
+        value ^= value >> 15;
+        value = value.wrapping_mul(0x846c_a68b);
+        value ^= value >> 16;
+        image::Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
     });
     let mut state = ViewerState::new(Viewport::default(), false)?;
     let mut terminal = Terminal::enter(GraphicsMode::Kitty, tmux_bandwidth_mbps)?;
@@ -1155,7 +1164,13 @@ impl OutputPump {
     }
 
     fn replace_graphics(&mut self, segments: Vec<Vec<u8>>) {
-        self.graphics.clear();
+        // Individual Kitty APC chunks are schedulable so controls can run between them, but an
+        // image transmission whose first m=1 chunk has reached the terminal must not lose its
+        // remaining chunks. Conservatively retain the current graphics queue while it is busy;
+        // once idle, pending graphics are known to be complete and can be superseded safely.
+        if !self.graphics_busy() {
+            self.graphics.clear();
+        }
         self.enqueue_graphics(segments);
     }
 
@@ -2344,14 +2359,36 @@ mod tests {
             graphics_limiter: None,
         };
         output.enqueue_graphics(vec![b"graphics-1".to_vec(), b"graphics-2".to_vec()]);
+        output.activate_next();
+        assert_eq!(output.active.as_ref().unwrap().bytes, b"graphics-1");
+        output.active = None;
         output.enqueue_control(b"control".to_vec());
-
         output.activate_next();
         assert_eq!(output.active.as_ref().unwrap().kind, OutputKind::Control);
+        assert_eq!(output.active.as_ref().unwrap().bytes, b"control");
         output.active = None;
         output.activate_next();
         assert_eq!(output.active.as_ref().unwrap().kind, OutputKind::Graphics);
+        assert_eq!(output.active.as_ref().unwrap().bytes, b"graphics-2");
         assert!(output.graphics_busy());
+    }
+
+    #[test]
+    fn replacing_graphics_does_not_strand_an_in_progress_upload() {
+        let mut output = OutputPump {
+            original_flags: OFlags::empty(),
+            active: None,
+            control: VecDeque::new(),
+            graphics: VecDeque::new(),
+            graphics_limiter: None,
+        };
+        output.enqueue_graphics(vec![b"old-m=1".to_vec(), b"old-m=0".to_vec()]);
+        output.activate_next();
+        output.active = None;
+        output.replace_graphics(vec![b"new-image".to_vec()]);
+
+        assert_eq!(output.graphics.pop_front().unwrap(), b"old-m=0");
+        assert_eq!(output.graphics.pop_front().unwrap(), b"new-image");
     }
 
     fn key(code: KeyCode) -> KeyEvent {

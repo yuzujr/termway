@@ -210,14 +210,18 @@ impl Renderer {
         let anchor_ready = previous_id.is_some();
         let mut output = Vec::new();
         if self.transport == Transport::Tmux && !anchor_ready {
-            push_upload_transaction(
+            push_upload(
                 &mut output,
                 self.transport,
                 self.image_id_base + ANCHOR_IMAGE_OFFSET,
                 &RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0])),
             )?;
         }
-        push_upload_transaction(&mut output, self.transport, image_id, image)?;
+        // Keep protocol chunks as separate scheduler segments. Kitty does require all chunks of
+        // one image to remain ordered, but ordinary terminal output may run between complete APC
+        // commands. A multi-megabyte segment would otherwise make input and chrome appear frozen
+        // for the duration of a full-screen upload.
+        push_upload(&mut output, self.transport, image_id, image)?;
         let mut transition = Vec::new();
         if self.transport == Transport::Tmux {
             push_anchor_placement(
@@ -564,18 +568,6 @@ fn push_upload(
         };
         push_apc(output, transport, &control, chunk);
     }
-    Ok(())
-}
-
-fn push_upload_transaction(
-    output: &mut Vec<Vec<u8>>,
-    transport: Transport,
-    image_id: u32,
-    image: &RgbImage,
-) -> Result<()> {
-    let mut chunks = Vec::new();
-    push_upload(&mut chunks, transport, image_id, image)?;
-    output.push(chunks.into_iter().flatten().collect());
     Ok(())
 }
 
@@ -946,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn atlas_upload_chunks_form_one_non_cancellable_protocol_transaction() {
+    fn atlas_upload_keeps_chunks_individually_schedulable() {
         let mut renderer = Renderer {
             transport: Transport::Direct,
             image_id_base: 7,
@@ -972,12 +964,20 @@ mod tests {
                 16,
             )
             .unwrap();
-        assert_eq!(segments.len(), 2);
-        let upload = String::from_utf8_lossy(&segments[0]);
-        assert!(upload.matches("m=1").count() > 1);
-        assert!(upload.contains("m=0"));
-        assert!(!upload.contains("a=p"));
-        assert!(segments[1].starts_with(BEGIN_SYNCHRONIZED_UPDATE));
+        assert!(segments.len() > 3);
+        assert!(String::from_utf8_lossy(&segments[0]).contains("m=1"));
+        assert!(
+            segments[1..segments.len() - 2]
+                .iter()
+                .all(|chunk| String::from_utf8_lossy(chunk).contains("m=1"))
+        );
+        assert!(String::from_utf8_lossy(&segments[segments.len() - 2]).contains("m=0"));
+        assert!(
+            segments
+                .last()
+                .unwrap()
+                .starts_with(BEGIN_SYNCHRONIZED_UPDATE)
+        );
     }
 
     #[test]
