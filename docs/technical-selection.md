@@ -1,114 +1,160 @@
-# 技术选型
+# Technical selection
 
-状态：已接受，用于第一轮技术验证。
+Status: accepted for the first round of technical validation.
 
-## 结论
+## Decisions
 
-| 领域 | 选择 | 暂不选择 |
+| Area | Choice | Not chosen |
 | --- | --- | --- |
-| 实现语言 | Rust stable edition 2024 | C++、Go |
-| 远程传输 | 现有 SSH PTY 的 stdin/stdout | 自定义 TCP、WebSocket、QUIC |
-| 终端控制 | `crossterm`，必要处直接写 ANSI | 完整依赖 ratatui 的渲染模型 |
-| 基础图像输出 | 24-bit ANSI + `▀` 半块字符 | ASCII 作为默认模式 |
-| 增强图像输出 | Kitty Graphics direct transmission | Sixel 作为第一阶段必需能力 |
-| niri 集成 | `$NIRI_SOCKET` 上的 JSON IPC | 绑定版本强耦合的 `niri-ipc` crate |
-| 捕获验证 | `grim` 子进程输出 PPM/PNG | 一开始就实现全部 Wayland 协议 |
-| 正式捕获 | `wayland-client` + `wayland-protocols-wlr` screencopy | PipeWire/portal 作为 niri 首选路径 |
-| 图像缩放 | MVP 使用 `image`，性能验证后考虑 `fast_image_resize` | 自研 SIMD 作为早期工作 |
-| 正式输入 | Wayland virtual pointer v2 + virtual keyboard v1 | `ydotool`、uinput broker、直接读取 input device |
-| 异步模型 | 主线程终端/输出循环 + 单槽后台 damage watcher | 无界帧队列或全量 async runtime |
-| 构建与开发 | Cargo + Nix flake | 仅依赖开发机全局工具链 |
+| Language | Rust stable, edition 2024 | C++, Go |
+| Remote transport | stdin/stdout of the existing SSH PTY | custom TCP, WebSocket, QUIC |
+| Terminal control | `crossterm`, raw ANSI where needed | full ratatui rendering model |
+| Base image output | 24-bit ANSI + `▀` half-blocks | ASCII as the default mode |
+| Enhanced image output | Kitty Graphics direct transmission | Sixel as a first-phase requirement |
+| niri integration | JSON IPC over `$NIRI_SOCKET` | a version-bound `niri-ipc` crate |
+| Capture validation | `grim` subprocess emitting PPM/PNG | implementing the full Wayland stack up front |
+| Production capture | `wayland-client` + `wayland-protocols-wlr` screencopy | PipeWire/portal as niri's preferred path |
+| Image scaling | `image` for MVP; `fast_image_resize` after perf validation | hand-written SIMD as early work |
+| Production input | Wayland virtual pointer v2 + virtual keyboard v1 | `ydotool`, an uinput broker, reading input devices directly |
+| Async model | main-thread terminal/output loop + single-slot background damage watcher | unbounded frame queues or a full async runtime |
+| Build & development | Cargo + Nix flake | relying on a machine-global toolchain |
 
-## 为什么选择 Rust
+## Why Rust
 
-这个程序同时处理不可信终端输入、Wayland buffer、像素计算、Unix socket 和 Linux input event。Rust 能减少帧缓冲区和协议解析中的内存错误，同时其 Wayland 与终端库足够成熟。项目目标又只包含一个 Linux 端二进制/服务组合，因此交叉编译到 macOS 不是必要条件。
+The program simultaneously handles untrusted terminal input, Wayland buffers,
+pixel math, Unix sockets and Linux input events. Rust reduces memory errors in
+frame buffers and protocol parsing, and its Wayland and terminal libraries are
+mature enough. The project ships a single Linux-side binary/service, so
+cross-compiling to macOS is not a requirement.
 
-## 为什么不使用独立 client/server 网络协议
+## Why not a separate client/server network protocol
 
-termway 在 SSH 登录后的远端主机上运行。它从 PTY 读取按键和终端鼠标序列，将 ANSI 或图像 escape sequence 写回同一个 PTY。认证、加密、端口转发、连接保活和访问控制继续由 SSH 负责。
+termway runs on the remote host after an SSH login. It reads keys and terminal
+mouse sequences from the PTY and writes ANSI or image escape sequences back to
+the same PTY. Authentication, encryption, port forwarding, keepalive and
+access control remain SSH's job.
 
-这直接满足“公司 Mac 不安装软件”的约束，也避免复制一套不完整的远程访问安全协议。
+That directly satisfies the "no software on the company Mac" constraint and
+avoids re-implementing an incomplete remote-access security protocol.
 
-## 终端渲染策略
+## Terminal rendering strategy
 
-### 必须可用：truecolor half-block
+### Must work: truecolor half-block
 
-字符 `▀` 的前景色表示上像素，背景色表示下像素。终端大小为 `C × R` 时，可以表达 `C × 2R` 个颜色采样点。
+The `▀` character's foreground color encodes the upper pixel and the
+background the lower one, so a `C × R` terminal expresses `C × 2R` color
+samples.
 
-优点：
+Pros:
 
-- 不依赖专用图像协议；
-- 可穿过 SSH 和 tmux；
-- macOS 常见现代终端均可使用；
-- 鼠标坐标与字符网格天然对应。
+- no dependency on a dedicated image protocol;
+- passes through SSH and tmux;
+- works in common modern macOS terminals;
+- mouse coordinates map naturally onto the character grid.
 
-缺点是分辨率有限。因此第一版必须提供局部缩放和“聚焦窗口”模式，不能只做整个高分辨率桌面的缩略图。
+The trade-off is limited resolution, which is why the first version must offer
+local zoom and a "focus window" mode rather than only a thumbnail of the whole
+high-resolution desktop.
 
-### 增强模式：Kitty Graphics
+### Enhanced mode: Kitty Graphics
 
-当前配置表明 macOS 与 NixOS 均使用 Kitty，因此第二优先级支持 Kitty Graphics 的 direct transmission。远程场景不能使用本地文件或共享内存传输；必须将压缩后的像素数据内嵌到 escape sequence 中，并探测终端响应。tmux 下需要单独验证 passthrough 和图片生命周期。
+The reference setup uses Kitty on both macOS and NixOS, so Kitty Graphics
+direct transmission is the second-priority renderer. Remote usage cannot use
+local files or shared-memory transport; the compressed pixel data must be
+embedded in the escape sequence and the terminal's capability probed. The tmux
+path needs separate validation of passthrough and image lifecycle.
 
-Sixel 可以以后作为第三个 renderer，不进入 MVP 的完成条件。
+Sixel can later become a third renderer; it is not a completion criterion for
+the MVP.
 
-### 为什么 50 Mbit/s 不能等同 Sunshine/Moonlight
+### Why 50 Mbit/s cannot be the same as Sunshine/Moonlight
 
-Kitty direct transport 只接收 RGB/RGBA、PNG，或 zlib 压缩后的像素；它不解码 H.264/H.265。
-[Waytermirror](https://github.com/cyber-wojtek/waytermirror) 的 pixel renderer 看起来也输出
-Kitty，但网络层实际是服务器 H.265 编码、已安装的本地 client 解码，再由 client 写入终端。
-Sunshine/Moonlight 同样依赖跨帧视频编码和本地解码。termway 的硬约束是 macOS 零安装，
-所以不能把视频码流直接交给 Kitty，只能在 SSH PTY 中发送独立图像/变化区域；这是同样带宽
-下帧率差异的根本来源。当前选择 terminal-side crop cache、damage tile、低位噪声抑制和
-动态空间分辨率，优先保证桌面操作延迟与静止文字清晰度。
+Kitty direct transport only accepts RGB/RGBA, PNG or zlib-compressed pixels; it
+does not decode H.264/H.265.
+[Waytermirror](https://github.com/cyber-wojtek/waytermirror)'s pixel renderer
+also emits Kitty, but its network layer is actually server-side H.265 encoding
+decoded by an installed local client, which then writes to the terminal.
+Sunshine/Moonlight likewise rely on cross-frame video encoding and local
+decoding. termway's hard constraint is zero-install on macOS, so it cannot hand
+a video stream to Kitty — it can only send individual images or changed
+regions over the SSH PTY. That is the root cause of the frame-rate difference
+at equal bandwidth. The current choice — a terminal-side crop cache, damage
+tiles, low-bit noise suppression and dynamic spatial resolution — prioritizes
+desktop-operation latency and static-text legibility.
 
-## niri 集成
+## niri integration
 
-niri 官方建议复杂程序直接连接 `$NIRI_SOCKET`。JSON IPC 有兼容性承诺，而 Rust `niri-ipc` crate 跟随 niri 自身版本，不遵循独立稳定 semver。因此采用：
+niri officially recommends connecting to `$NIRI_SOCKET` directly for complex
+programs. The JSON IPC carries a compatibility promise, while the Rust
+`niri-ipc` crate tracks niri's own version and does not follow an independent
+stable semver. Therefore:
 
-- JSON event stream 维护 output、workspace、window、focus 状态；
-- JSON action 聚焦目标窗口；
-- serde 数据结构允许未知字段，避免新 niri 字段导致解析失败；
-- `niri msg --json` 只作为诊断和 spike 工具，正式实现直接访问 Unix socket。
+- a JSON event stream maintains output, workspace, window and focus state;
+- JSON actions focus the target window;
+- serde structures allow unknown fields so a new niri field cannot break parsing;
+- `niri msg --json` is only a diagnostic and spike tool; the production path reads the Unix socket directly.
 
-当前机器是 niri 26.04，并启用了 1.25 fractional scale。捕获像素、niri logical coordinates、终端 cell coordinates 三套坐标必须显式建模，不能混用。
+The reference environment runs niri 26.04 with 1.25 fractional scaling
+enabled. Capture pixels, niri logical coordinates, and terminal cell
+coordinates are three coordinate systems that must be modeled explicitly and
+never mixed.
 
-## 屏幕捕获
+## Screen capture
 
-第一轮用 `grim` 快速回答三个问题：SSH session 能否找到活动 Wayland display、截图延迟是多少、缩放并输出到终端后的可读性如何。
+The first round used `grim` to quickly answer three questions: whether an SSH
+session can find the active Wayland display, what the screenshot latency is,
+and how legible a scaled, terminal-rendered image is.
 
-验证成立后已改为 `zwlr_screencopy_manager_v1`，grim 保留为自动回退：
+Once validated, the implementation moved to `zwlr_screencopy_manager_v1`,
+keeping grim as the automatic fallback:
 
-- niri 已支持 wlr-screencopy v3；
-- 可以按 output 或 region 捕获；
-- 可利用 damage 信息减少无变化帧输出；
-- 无需每帧创建子进程。
+- niri supports wlr-screencopy v3;
+- capture works per output or region;
+- damage information avoids emitting unchanged frames;
+- no subprocess is spawned per frame.
 
-当前实现持有一个长期 Wayland connection，并复用 memfd-backed `wl_shm` buffer。首版绑定
-向后兼容的协议 v1 完成验证后，已升级到 v3：等待 `buffer_done` 完成格式枚举，并在独立
-后台连接上运行 `copy_with_damage`。连续结果通过单槽 latest-frame 状态交给终端主线程，
-避免慢 SSH 链路积压帧；立即刷新使用另一条 `copy` 路径，保留确定的响应时间。
+The implementation holds one long-lived Wayland connection and reuses a
+memfd-backed `wl_shm` buffer. The first version bound the backwards-compatible
+protocol v1 to validate the format enumeration, then upgraded to v3: it waits
+for `buffer_done` to complete format enumeration and runs `copy_with_damage`
+on a separate background connection. Continuous results pass to the terminal
+main thread through a single-slot latest-frame state, so a slow SSH link never
+queues frames; an immediate refresh uses a separate `copy` path with a
+bounded response time.
 
-窗口捕获初期采用“聚焦窗口后捕获其所在 output + viewport/zoom”。验证表明 niri 26.04 尚未提供 grim `-T` 所需的 `ext-image-copy-capture`，且 IPC 中窗口位置字段允许为空，因此不能可靠地直接捕获或按绝对坐标裁切窗口。当前实现使用与窗口坐标无关的 output viewport；未来 compositor 支持相应协议后再增加单窗口 backend。
+Window capture initially took the "focus the window, then capture its output
+with a viewport/zoom" approach. Validation showed niri 26.04 does not yet
+provide the `ext-image-copy-capture` protocol that `grim -T` needs, and IPC
+window-position fields may be empty, so a window cannot be reliably captured or
+cropped by absolute coordinates. The current implementation uses output
+viewports independent of window coordinates; single-window capture can return
+once the compositor supports the corresponding protocol.
 
-## 输入路径
+## Input path
 
-终端侧启用：
+The terminal side enables:
 
-- raw mode；
-- alternate screen；
-- bracketed paste；
-- SGR extended mouse mode；
-- focus events（可用时）。
+- raw mode;
+- alternate screen;
+- bracketed paste;
+- SGR extended mouse mode;
+- focus events (when available).
 
-程序把字符、功能键和鼠标 cell 坐标转换成内部事件。当前 niri 直接暴露
-`zwlr_virtual_pointer_manager_v1` 和 `zwp_virtual_keyboard_manager_v1`，因此正式路径使用普通
-用户的 Wayland connection 注入绝对定位、左右键、双轴滚轮和键盘事件，不需要 `ydotool`、
-uinput service、`input` group 或高权限 broker。非 ASCII 输入通过按需生成的小型 XKB keymap
-直接发送 Unicode code point。compositor-global shortcut 不接收 virtual keyboard 事件，
-这类入口由配置驱动的 action palette 调用普通命令。
+The program turns characters, function keys and mouse cell coordinates into
+internal events. niri currently exposes
+`zwlr_virtual_pointer_manager_v1` and `zwp_virtual_keyboard_manager_v1`
+directly, so the production path injects absolute positions, left/right
+buttons, two-axis wheels and keyboard events through an ordinary-user Wayland
+connection — no `ydotool`, uinput service, `input` group or privileged broker.
+Non-ASCII input is sent as a Unicode code point through a small, on-demand XKB
+keymap. Compositor-global shortcuts do not receive virtual-keyboard events;
+those entry points are provided by the config-driven action palette, which
+invokes ordinary commands.
 
-## 初始 Rust 依赖候选
+## Initial Rust dependency candidates
 
-依赖在对应 spike 开始时再加入，避免过早锁定：
+Dependencies are added when the corresponding spike starts, to avoid locking
+in early:
 
 - `anyhow` / `thiserror`
 - `clap`
@@ -117,15 +163,16 @@ uinput service、`input` group 或高权限 broker。非 ASCII 输入通过按�
 - `image`
 - `wayland-client`
 - `wayland-protocols-wlr`
-- `zbus`（idle inhibitor）
+- `zbus` (idle inhibitor)
 
-不把大型视频编码器、FFmpeg、PipeWire 或 GUI toolkit 放进第一阶段依赖树。
+No large video encoders, FFmpeg, PipeWire or GUI toolkit goes into the
+first-phase dependency tree.
 
-## 已知高风险点
+## Known high-risk areas
 
-1. SSH 启动的进程如何稳定发现图形 session 的 `NIRI_SOCKET`、`WAYLAND_DISPLAY` 和 `XDG_RUNTIME_DIR`。
-2. fractional scaling、output transform 和终端 cell 到桌面坐标的映射。
-3. tmux 对 Kitty Graphics 和终端能力查询响应的转发。
-4. macOS 终端按键序列无法无损表达所有 Linux keycode，特别是修饰键按下/释放状态。
-5. virtual keyboard 无法触发 compositor-global shortcut，需要 action palette 替代入口。
-6. 全屏高频 ANSI 更新的带宽和 tmux CPU 消耗。
+1. How an SSH-spawned process reliably discovers the graphical session's `NIRI_SOCKET`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.
+2. Fractional scaling, output transform, and the terminal-cell to desktop-coordinate mapping.
+3. tmux forwarding of Kitty Graphics and terminal-capability query responses.
+4. macOS terminal key sequences cannot losslessly express every Linux keycode, especially modifier press/release state.
+5. The virtual keyboard cannot trigger compositor-global shortcuts, so the action palette must provide those entry points.
+6. Bandwidth and tmux CPU consumption of fullscreen high-frequency ANSI updates.

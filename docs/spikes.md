@@ -1,136 +1,163 @@
-# 技术验证计划
+# Technical validation plan
 
-每个 spike 必须能独立失败；失败时记录结论并重新选型，不把未知风险带进主体实现。
+Each spike must be able to fail on its own; on failure, record the conclusion
+and re-evaluate the choice rather than carrying unknown risk into the main
+implementation.
 
-## Spike 0：环境探测（已实现）
+## Spike 0: Environment discovery (done)
 
-目标：从普通 SSH login 和已有 tmux session 中发现活动 niri session。
+Goal: discover the active niri session from an ordinary SSH login and an
+existing tmux session.
 
-验收：
+Acceptance:
 
-- 找到并连接 `$NIRI_SOCKET`；
-- 获取 outputs、windows、focused window 和 event stream；
-- 找到正确 Wayland socket；
-- 在多个 SSH/tmux attach 场景中不给环境变量写死具体 socket 名。
+- find and connect to `$NIRI_SOCKET`;
+- get outputs, windows, the focused window and the event stream;
+- find the correct Wayland socket;
+- do not hardcode a specific socket name in the environment across multiple
+  SSH/tmux attach scenarios.
 
-实现会依次检查命令行覆盖、当前进程环境、systemd user environment 和 runtime directory。扫描得到多个活动 niri session 时拒绝猜测，要求显式传入 `--niri-socket`。
+The implementation checks, in order, the command-line override, the current
+process environment, the systemd user environment and the runtime directory.
+When several active niri sessions are discovered it refuses to guess and
+requires an explicit `--niri-socket`.
 
-## Spike 1：只看画面（已完成）
+## Spike 1: View-only (done)
 
-目标：`grim` 截图经缩放后，以 truecolor half-block 输出到当前 PTY。
+Goal: a `grim` screenshot, scaled, rendered to the current PTY as truecolor
+half-blocks.
 
-验收：
+Acceptance:
 
-- macOS 端不安装 termway client；
-- Terminal/Kitty → SSH → tmux 链路显示正确；
-- 正确处理 1.25 scale 和终端 resize；
-- CC Switch 的 profile 名在局部 zoom 下可读；
-- 记录单帧耗时、字节数和 CPU。
+- no termway client installed on the macOS side;
+- the Terminal/Kitty → SSH → tmux chain displays correctly;
+- 1.25 scale and terminal resize handled correctly;
+- the CC Switch profile names are legible under local zoom;
+- single-frame time, bytes and CPU recorded.
 
-当前实现：
+Current implementation:
 
-- 自动从 niri focused output 选择目标，也支持 `--output` 覆盖；
-- 为 `grim` 补齐 SSH session 中缺失的 `WAYLAND_DISPLAY`；
-- 直接解析 stdout 中的 P6 PPM，不创建持久截图文件；
-- 使用 triangle filter 等比缩放；
-- 每个 `▀` 字符以前景色承载上像素、背景色承载下像素；
-- 自动读取终端尺寸，也支持 `--cols`/`--rows`；
-- 支持 `--zoom` 与归一化的 `--center-x`/`--center-y` viewport；
-- 图像与 metrics 分别写入 stdout/stderr。
-- 提供 alternate-screen 交互 viewer，支持即时 zoom、pan、resize 和手动刷新；
-- 所有正常错误与退出路径均恢复 raw mode、光标和 line wrap。
+- selects the target from niri's focused output by default, with `--output` override;
+- fills in the `WAYLAND_DISPLAY` an SSH session is missing for `grim`;
+- parses the P6 PPM from stdout directly, without creating a persistent screenshot file;
+- scales proportionally with a triangle filter;
+- each `▀` character carries the upper pixel in the foreground and the lower in the background;
+- reads the terminal size automatically, with `--cols`/`--rows` support;
+- supports `--zoom` and normalized `--center-x`/`--center-y` viewports;
+- writes the image and metrics to stdout/stderr respectively;
+- provides an alternate-screen interactive viewer with instant zoom, pan, resize and manual refresh;
+- restores raw mode, cursor and line wrap on every error and exit path.
 
-2026-08-01 在当前 eDP-1（2560×1600、scale 1.25）上的 release 实测：
+Measured 2026-08-01 on the reference setup (eDP-1, 2560×1600, scale 1.25),
+release build:
 
-- grim 捕获约 30–32 ms；
-- 115×36 cells 渲染约 9 ms；
-- 单帧 ANSI 约 170 KB；
-- 80×24 tmux pane 中实际图像宽 73 cells，没有横向换行。
+- grim capture ≈ 30–32 ms;
+- 115×36 cells rendered ≈ 9 ms;
+- one ANSI frame ≈ 170 KB;
+- in an 80×24 tmux pane the image is 73 cells wide with no horizontal wrap.
 
-单独捕获 focused window 的路径也做了验证。niri 的 IPC window ID 与 foreign-toplevel identifier 可以对应，但当前 niri 26.04 没有实现 grim `-T` 所需的 `ext-image-copy-capture` 窗口捕获协议。因此当前版本使用 output viewport zoom，不依赖不稳定的窗口绝对坐标。未来 compositor 支持该协议时可以重新启用单窗口捕获。
+A focused-window capture path was also validated. niri's IPC window ID
+corresponds to the foreign-toplevel identifier, but the current niri 26.04
+does not implement the `ext-image-copy-capture` window-capture protocol that
+`grim -T` needs, so the current version uses output-viewport zoom and does not
+rely on unstable window absolute coordinates. Single-window capture can be
+re-enabled once the compositor supports the protocol.
 
-macOS SSH 实测确认：half-block 在 5× 以上配合合适 viewport 可以读清 CC Switch 文字。因此该 renderer 定位为不支持 Kitty Graphics 时的兼容回退：1× 用于全景定位，5×–9× 用于阅读和操作。连续刷新和 damage tracking 属于 Spike 4。
+Measured over macOS SSH: half-block rendering at 5× and above with a suitable
+viewport is legible enough to read CC Switch text. That renderer is therefore
+positioned as the compatibility fallback when Kitty Graphics is unavailable:
+1× for overview positioning, 5×–9× for reading and operating. Continuous
+refresh and damage tracking belong to Spike 4.
 
-## Spike 2：终端输入（已完成）
+## Spike 2: Terminal input (done)
 
-目标：只解析并可视化终端事件，不注入桌面。
+Goal: parse and visualize terminal events only; do not inject into the desktop.
 
-验收：
+Acceptance:
 
-- 字符、方向键、组合键、bracketed paste；
-- SGR mouse 的移动、按下、释放和滚轮；
-- tmux 内外行为一致；
-- SSH 中断后恢复终端模式和光标。
+- characters, arrow keys, combos, bracketed paste;
+- SGR mouse move, press, release and wheel;
+- identical behavior inside and outside tmux;
+- terminal mode and cursor restored after an SSH interruption.
 
-viewer 已覆盖 ASCII/Unicode、方向和功能键、修饰键、resize、SGR 左右键和双轴滚动，并
-通过真实 tmux `send-keys` 测试。INPUT 模式用 `Ctrl-\` 前缀保留 TUI 控制入口。
+The viewer covers ASCII/Unicode, directional and function keys, modifiers,
+resize, SGR left/right buttons and two-axis scrolling, and is exercised through
+real tmux `send-keys`. The `Ctrl-\` prefix keeps the TUI control entry point in
+INPUT mode.
 
-## Spike 3：家中侧输入注入（已完成）
+## Spike 3: Home-side input injection (done)
 
-实现改为直接使用 Wayland virtual pointer v2 和 virtual keyboard v1，不再需要 ydotool、
-uinput 权限或后台 service。已实测可操作 CC Switch、直接输入中文、左右键点击与双轴滚动。
+The implementation switched to Wayland virtual pointer v2 and virtual keyboard
+v1 directly, so no ydotool, uinput privileges or background service is needed.
+Verified in practice: operating CC Switch, typing Chinese directly, left/right
+clicks and two-axis scrolling.
 
-验收：
+Acceptance:
 
-- 可以点击 CC Switch 中的目标 profile；
-- 可以输入 ASCII 与中文 paste；
-- 终端 cell 到 1.25-scale output 的映射正确；
-- 任意退出路径不会遗留按下状态。
+- can click a target profile in CC Switch;
+- can type ASCII and paste Chinese;
+- terminal-cell to 1.25-scale output mapping is correct;
+- no exit path leaves a key held down.
 
-## Spike 4：原生连续捕获（已完成）
+## Spike 4: Native continuous capture (done)
 
-目标：用 wlr-screencopy 替换 `grim`。
+Goal: replace `grim` with wlr-screencopy.
 
-已完成的基础路径：
+Baseline paths implemented:
 
-- 直接连接 SSH session 发现的 Wayland socket；
-- 选择 niri 的目标 `wl_output`；
-- 通过 `zwlr_screencopy_manager_v1` 捕获完整 output；
-- 使用 memfd-backed `wl_shm` buffer，并在尺寸和格式不变时跨帧复用；
-- 处理 stride、XRGB/ARGB/XBGR/ABGR 和 Y-invert；
-- 原生 backend 不可用或运行中失败时自动回退到 `grim`。
-- 使用独立后台连接运行 `copy_with_damage`，不阻塞终端输入和立即刷新；
-- 连续帧最高 5 FPS，单槽 latest-frame 交接保证慢终端不会积压旧帧；
-- damage 不与当前 viewport 相交或可见像素未变化时不发送 ANSI 重绘。
+- connects the Wayland socket the SSH session discovers;
+- selects niri's target `wl_output`;
+- captures the full output through `zwlr_screencopy_manager_v1`;
+- uses a memfd-backed `wl_shm` buffer and reuses it across frames when size and format are unchanged;
+- handles stride, XRGB/ARGB/XBGR/ABGR and Y-invert;
+- automatically falls back to `grim` when the native backend is unavailable or fails at runtime;
+- runs `copy_with_damage` on a separate background connection without blocking terminal input or immediate refresh;
+- continuous frames run at up to 5 FPS; a single-slot latest-frame handoff ensures a slow terminal never queues stale frames;
+- no ANSI redraw is sent when damage does not intersect the current viewport or visible pixels are unchanged.
 
-当前 niri 26.04 实际暴露 wlr-screencopy v3，但没有暴露
-ext-image-copy-capture。termway 首版 client 绑定兼容的 screencopy v1，以获得有保证的
-`wl_shm` 格式协商。当前实现已升级到 v3，等待 `buffer_done` 后选择 SHM buffer，并使用
-`copy_with_damage` 驱动后台连续更新。
+The current niri 26.04 exposes wlr-screencopy v3 but not
+ext-image-copy-capture. The first termway client bound the compatible
+screencopy v1 for a guaranteed `wl_shm` format negotiation. The current
+implementation has upgraded to v3: it waits for `buffer_done`, selects the SHM
+buffer, and uses `copy_with_damage` to drive background continuous updates.
 
-2026-08-01 同一 eDP-1 上的 release 单帧命令实测为 17.7–18.7 ms（包含新建 Wayland
-连接），相比 warm grim 的约 30–32 ms 已有下降。viewer 会继续复用连接和 buffer。
+Measured 2026-08-01 on the same eDP-1, release build: a single-frame command
+runs in 17.7–18.7 ms (including creating the Wayland connection), down from
+warm grim's ≈30–32 ms. The viewer keeps reusing the connection and buffers.
 
-验收：
+Acceptance:
 
-- 复用 buffers；（已完成）
-- 利用 damage 或等价机制避免无意义刷新；（已实现）
-- 默认 5 FPS 下交互可用；（已通过 SSH/tmux 实测）
-- SSH 延迟和带宽受限时不堆积旧帧。（latest-frame + 非阻塞输出已实现）
+- reuse buffers (done);
+- use damage or an equivalent mechanism to avoid pointless refreshes (implemented);
+- interactive at the default 5 FPS (verified over SSH/tmux);
+- no stale frame accumulation under SSH latency and bandwidth limits (latest-frame + non-blocking output implemented).
 
-## Spike 5：Kitty Graphics（已完成）
+## Spike 5: Kitty Graphics (done)
 
-目标：在支持时自动提供高分辨率模式。
+Goal: automatically provide a high-resolution mode when supported.
 
-验收：
+Acceptance:
 
-- 直接数据传输，不引用远端文件路径；
-- 原生 SSH 与 tmux 两种链路均完成能力探测；
-- 不支持或响应超时时无缝降级至 half-block；
-- resize、切 pane、detach/attach 后不残留图片。
+- direct transmission, no reference to remote file paths;
+- capability probing on both the native SSH and tmux paths;
+- seamless fallback to half-block when unsupported or on response timeout;
+- no images linger after resize, pane switch, or detach/attach.
 
-当前实现包含 1080p terminal-side navigation atlas、source-crop 即时 zoom/pan、延迟 tile
-refine、tmux 单锚点 relative placement、稳定双缓冲 tile、带宽 pacing 和 1080p–360p 自适应
-画质。固定 7-bit/channel 预处理最大误差为 1/255，可显著减少 PNG。无法使用 Kitty 时
-`auto` 自动回退到带 cell diff 的 ANSI half-block。
+The current implementation includes a 1080p terminal-side navigation atlas,
+instant source-crop zoom/pan, delayed tile refine, single-anchor tmux relative
+placement, stable double-buffered tiles, bandwidth pacing and 1080p–360p
+adaptive quality. The fixed 7-bit-per-channel preprocessing keeps the maximum
+error at 1/255 while shrinking PNGs substantially. When Kitty is unavailable,
+`auto` falls back to ANSI half-block with cell diff.
 
-## MVP 完成定义
+## MVP completion criteria
 
-在 macOS 的现有终端中 SSH 到家里 NixOS，进入 tmux 后运行 termway，可以：
+From a terminal on a macOS machine, SSH to the home NixOS host, enter tmux and
+run termway:
 
-1. 通过全景和 click-to-focus 找到 CC Switch；
-2. 看清 profile 列表；
-3. 使用键盘或终端鼠标切换 profile；
-4. 通过配置式 action palette 打开应用或调用 compositor action；
-5. 安全退出并回到 shell；
-6. macOS 端除 SSH/终端外不安装任何组件。
+1. find CC Switch through the overview and click-to-focus;
+2. read the profile list;
+3. switch profiles with the keyboard or terminal mouse;
+4. open an app or invoke a compositor action through the config-driven action palette;
+5. exit cleanly back to the shell;
+6. nothing but SSH and the terminal is installed on the macOS side.

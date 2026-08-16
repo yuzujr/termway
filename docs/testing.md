@@ -1,32 +1,47 @@
-# 测试方法
+# Testing
 
-termway 的图形路径不能只靠检查 escape sequence，也不能把所有肉眼验收留给使用者。当前分三层验证：
+termway's graphics path cannot be validated by inspecting escape sequences
+alone, and it should not push all visual acceptance onto users. Validation is
+layered three ways:
 
-1. `cargo test` 检查 viewport/坐标映射、tile diff、输出队列、Kitty image 生命周期，以及
-   placement、delete、同步更新的协议顺序；导航策略测试还要求 stale atlas 只能直接 refine
-   当前帧，不能进入 preview。
-2. `scripts/visual-regression.sh` 在真实 Kitty 和真实 Kitty+tmux 中启动确定性四色 fixture，
-   用 `grim` 连续截图并由 ImageMagick 取样。缩放前必须是洋红色 refined tile，缩放后必须是
-   红色 atlas crop；过渡中的每一张截图只能属于这两种完整状态。四色原图、背景、上下分裂或
-   条带都会直接令测试失败。stale-atlas 用例会通过生产 `draw_kitty` 管线把高细节初始 atlas
-   标记为过期、显示纯色当前帧，再在 direct/tmux 中缩放；状态栏不得显示 loading，连续
-   截图也不得出现旧 atlas 像素。最后的质量用例先验证 atlas 上传期间的 viewport 控制能在
-   1 秒内更新状态栏，再从高缩放回到 1×，比较 atlas 阶段与 refine 截止后的图像区域；
-   后者只允许保持一致，不能变糊。
-3. 发布前运行 release build、Clippy、Nix flake check，再用真实 `termway view` 做输入延迟和
-   compositor 集成 smoke test。视觉测试产物保存在 `target/visual-regression/`，可以直接检查
-   `direct-montage.png`、`tmux-montage.png` 与 `stale-*-montage.png`。
+1. `cargo test` covers viewport/coordinate mapping, tile diff, the output
+   queue, Kitty image lifecycle, and the protocol order of placement, delete
+   and synchronized updates; the navigation-strategy tests also require a
+   stale atlas to refine the current frame directly without entering preview.
+2. `scripts/visual-regression.sh` runs a deterministic four-color fixture in a
+   real Kitty and a real Kitty+tmux, screenshots continuously with `grim` and
+   samples the frames with ImageMagick. Before zooming the image must be a
+   magenta refined tile; after zooming it must be a red atlas crop; every
+   screenshot during the transition must be one of these two complete states.
+   A four-color source, a background, a vertical split or banding fails the
+   test directly. The stale-atlas case marks a high-detail initial atlas stale
+   through the production `draw_kitty` pipeline, displays a solid-color current
+   frame, then zooms in direct/tmux; the status line must not show loading and
+   no screenshot may contain stale-atlas pixels. The final quality case first
+   verifies that viewport control during an atlas upload updates the status
+   line within 1 s, then zooms back from a high zoom to 1× and compares the
+   atlas phase with the post-refine image region; the latter may only stay
+   identical, never get blurrier.
+3. Before release: run the release build, Clippy and `nix flake check`, then a
+   real `termway view` input-latency and compositor-integration smoke test.
+   Visual artifacts land in `target/visual-regression/`; check
+   `direct-montage.png`, `tmux-montage.png` and `stale-*-montage.png`.
 
-在已解锁的 niri 图形会话内运行；脚本检测到 systemd-logind 的图形 session 仍锁定时会直接
-退出，避免把覆盖 Kitty 的锁屏误报成渲染失败：
+Run inside an unlocked niri graphical session; the script exits if
+systemd-logind still reports the graphical session locked, so a lock screen
+covering Kitty is not misreported as a render failure:
 
 ```console
 nix develop -c scripts/visual-regression.sh
 ```
 
-该测试会依次短暂打开多个全屏 Kitty 窗口，完成后自动关闭并恢复原先聚焦的窗口。fixture 的协议
-分段被故意延迟 20ms，因此非原子的实现会被稳定放大并捕获，不依赖截图恰好撞上短暂坏帧。
-stale-atlas 测试把 fixture 的 preview 窗口延长到 750ms、atlas refresh 延长到 10 秒，使错误
-atlas 可以被稳定捕获且不会在断言前变成合法的新 atlas；质量
-测试走真实 tmux pacing，并确定性地把候选 refine 设为 360p，避免测试是否覆盖退化分支取决
-于某一台机器上的 PNG 压缩率。
+The test opens several fullscreen Kitty windows in sequence and restores the
+previously focused window afterwards. The fixture's protocol chunks are
+deliberately delayed by 20 ms so a non-atomic implementation is reliably
+amplified and captured rather than depending on a screenshot accidentally
+hitting a transient bad frame. The stale-atlas test extends the fixture's
+preview window to 750 ms and the atlas refresh to 10 s so a wrong atlas is
+stably captured and cannot become a legitimate new atlas before the assertion;
+the quality test runs through real tmux pacing and deterministically pins the
+candidate refine to 360p so whether a degraded branch is covered does not
+depend on the PNG compression ratio on any particular machine.

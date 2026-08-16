@@ -1,33 +1,41 @@
-# ADR-0001：采用 SSH-native 架构
+# ADR-0001: Adopt an SSH-native architecture
 
-- 状态：接受
-- 日期：2026-08-01
+- Status: accepted
+- Date: 2026-08-01
 
-## 背景
+## Context
 
-使用者从受管控的 macOS 电脑通过 SSH 和 tmux 访问家里的 NixOS/niri。macOS 不能安装远程桌面客户端，更不能授予读取输入设备等高权限。
+The user accesses a home NixOS/niri host over SSH and tmux from a managed
+macOS laptop. macOS cannot install a remote-desktop client, let alone grant
+high-privilege access such as reading input devices.
 
-现有 Waytermirror 采用单独 client/server 和裸 TCP streams。其 client 直接使用 libinput 获取本地键盘鼠标，因此不能等同于在远端 tmux pane 中读取 PTY 输入。
+The previous Waytermirror approach used a separate client/server pair over raw
+TCP streams. Its client read the local keyboard and mouse directly through
+libinput, so it cannot be treated as reading PTY input inside a remote tmux
+pane.
 
-## 决策
+## Decision
 
-termway 本体运行在远端 NixOS 主机。它只使用当前 PTY 的 stdin/stdout 与用户交互，不定义跨网络应用协议，也不需要 macOS 二进制。
+termway itself runs on the remote NixOS host. It interacts with the user only
+through the current PTY's stdin/stdout, defines no cross-network application
+protocol, and needs no macOS binary.
 
-画面捕获、输入注入和 niri 状态均来自远端 graphical session。niri 提供的 Wayland virtual
-pointer/keyboard protocols 足以完成输入，因此实现不需要特权 broker。
+Screen capture, input injection and niri state all come from the remote
+graphical session. niri's Wayland virtual pointer/keyboard protocols are
+sufficient for input, so the implementation needs no privileged broker.
 
-## 后果
+## Consequences
 
-正面：
+Positive:
 
-- macOS 零安装；
-- 直接兼容 SSH 的认证、加密和审计；
-- 能自然运行于 tmux；
-- 没有额外开放端口。
+- zero-install on macOS;
+- directly compatible with SSH's authentication, encryption and audit;
+- runs naturally inside tmux;
+- no extra open ports.
 
-代价：
+Costs:
 
-- 受终端协议表达能力限制；
-- 无法获得原生 client 那样完整的按键按下/释放信息；
-- Kitty/Sixel 等增强能力依赖终端与 tmux；
-- 音频和高帧率视频不属于适合的目标。
+- limited by the terminal protocol's expressive power;
+- cannot get full key press/release fidelity the way a native client can;
+- enhanced capabilities such as Kitty/Sixel depend on the terminal and tmux;
+- audio and high-frame-rate video are not suitable targets.
