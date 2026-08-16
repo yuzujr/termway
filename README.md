@@ -35,6 +35,21 @@ Viewing and controlling a NixOS desktop over SSH, inside a tmux pane:
 - **tmux**: `set -g allow-passthrough on` for the tmux path
 - Kitty 0.31+ is recommended for the tmux graphics path
 
+## Installation
+
+Add the flake and install the package:
+
+```nix
+{
+  inputs.termway.url = "github:yuzujr/termway";
+  # In your Home Manager or NixOS packages:
+  home.packages = [ inputs.termway.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+}
+```
+
+The package wraps `grim` (termway's screencopy fallback) into its own PATH;
+`tmux` and `systemctl` are read from the host environment.
+
 ## Quick start
 
 ```console
