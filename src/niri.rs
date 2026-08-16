@@ -123,6 +123,22 @@ impl Client {
             .with_context(|| format!("niri has no output named {name}"))?;
         parse_output_geometry(output)
     }
+
+    pub fn output_geometries(&mut self) -> Result<Vec<OutputGeometry>> {
+        let reply = self.request("Outputs")?;
+        let outputs = variant(&reply, "Outputs")?
+            .as_object()
+            .context("niri Outputs response is not an object")?;
+        outputs
+            .values()
+            .filter(|output| {
+                output
+                    .get("logical")
+                    .is_some_and(|logical| !logical.is_null())
+            })
+            .map(parse_output_geometry)
+            .collect()
+    }
 }
 
 fn parse_output_geometry(output: &Value) -> Result<OutputGeometry> {

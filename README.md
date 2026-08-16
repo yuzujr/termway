@@ -24,7 +24,7 @@ $ ssh home
 $ tmux new-window -n gui termway
 ```
 
-启动后显示 niri 当前 output；用 click-to-focus/zoom 定位目标，按需 arm 鼠标或进入 INPUT
+启动后显示 niri 当前 output；用 click-to-focus/zoom 定位目标，按需开启鼠标或进入 Keyboard
 模式，把当前终端中的键盘、鼠标和滚动事件发送给桌面。常用程序和 compositor action 由
 配置式 action palette 提供入口。
 
@@ -61,6 +61,16 @@ termway 优先通过持久 Wayland 连接直接使用 `wlr-screencopy`，并在�
 `wl_shm` buffer，不再为每次刷新启动截图进程。compositor 不支持该协议或原生捕获失败时，
 会自动回退到 `grim`；`capture` 命令的 stderr 会显示实际 backend。
 
+多显示器按“一个 viewer 对应一个 output”工作。默认在启动时选择 niri focused output，
+状态栏中的 `eDP-1` 就是当前被捕获和绑定输入的 Wayland output 名称；也可以使用
+`view --output DP-1`、`capture --output DP-1`，或配置顶层 `output = "DP-1"`。`doctor` 会列出
+所有已启用 output 的逻辑尺寸、位置、scale、transform 和当前焦点。不同 fractional scale、
+位于主屏左侧/上方而产生的负全局坐标均已纳入映射和单元测试。
+
+当前还不是全桌面多屏 viewer：不会拼接多个 output，不会随 niri 焦点自动切屏，也不会在
+热插拔后重建捕获/输入对象；旋转或翻转 transform 仍会明确拒绝。多个普通方向显示器可以
+分别启动 `termway view --output <name>` 使用，但这些组合尚未经过真实多屏硬件回归。
+
 viewer 在原生 backend 上额外运行最高 5 FPS 的 damage watcher。桌面静止时 compositor
 不会产生新帧；damage 发生在当前 viewport 之外时也不会重绘。同一 viewport 下会比较
 新旧终端 cell，只发送变化的连续 cell 区间；完全相同的 cell buffer 不产生图像输出。
@@ -76,8 +86,10 @@ cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使�
 替换发生变化的 tile，新 tile 显示后才回收旧 tile，不使用 Kitty animation frame patch。
 整帧会先归一到 terminal cell 的精确宽高比，避免各 tile 独立缩放产生接缝；每个 tile 使用
 完整协议单元无空窗替换。首次显示会在 terminal 内缓存一张全屏 navigation atlas；缩放和
-平移立即通过 Kitty 的 source crop 重新 placement，不重新缩放、编码或传输像素，输入停止
-120ms 后再用高分辨率 tile 覆盖预览。tmux 下只写一个 Unicode placeholder 作为 pane
+平移会在 atlas 内容仍是当前桌面时，立即通过 Kitty 的 source crop 重新 placement，不重新
+缩放、编码或传输像素，输入停止 120ms 后再用高分辨率 tile 覆盖预览。atlas 已因 desktop
+damage 过期时不会显示旧 crop，也不会额外等待 120ms，而是直接从最新捕获帧生成 tile。
+tmux 下只写一个 Unicode placeholder 作为 pane
 左上角锚点，atlas 和 tile 都使用 Kitty relative placement 挂到该锚点；zoom/pan 因而只需
 更新真正支持 source crop 的普通 placement，不会重写整屏 placeholder，也不会短暂退回 1×
 原图。atlas crop、旧 tile 回收和锚点变更放在同一个 DEC synchronized update 中提交。
@@ -85,22 +97,23 @@ cell 对齐，拆成约 128×128 像素的稳定 PNG tile；damage 到来时使�
 refine 还遵守单调画质约束：fresh atlas crop 的有效像素数如果不低于带宽自适应后的 raster，
 就保留 atlas，不允许 720p/540p/360p tile 反向覆盖成更模糊的画面；atlas 已因 desktop damage
 过期时则优先显示较低分辨率的新内容，并在静止后刷新高质量 atlas。
-modeline 会在 crop 阶段显示 `GFX:KITTY/PREVIEW`，refine 后显示实际档位（例如
-`GFX:KITTY/720p`）；ANSI 则显示 `GFX:ANSI`。
+状态栏会显示当前实际档位和画质模式（例如 `720p Auto`）；atlas 正在准备时显示
+`1080p loading`，ANSI fallback 则显示 `ANSI`。
 
-1× 全景发生 damage 后，变化先走 tile diff；画面静止 2 秒会生成一次新的高质量 atlas
-keyframe 并回收 tile generations。这样后续 click-to-focus 使用的是当前桌面，而不是启动时
-的旧截图，同时视频/动画期间不会反复发送完整 atlas。
+发生 damage 后，变化先走 tile diff；画面静止 2 秒会生成一次新的高质量 atlas keyframe
+并回收 tile generations，不要求当时已经回到 1× 全景。这样后续 click-to-focus 可以重新
+使用低延迟 crop；静止前的导航则直接渲染当前帧，不会退回启动时的旧截图，同时视频/动画
+期间不会反复发送完整 atlas。
 
 Kitty raster 在 PNG 前丢弃每个 sRGB channel 的最低 1 bit，单通道最大误差仅 1/255，视觉上
 等同原图，同时抑制截图低位噪声。固定 1080p 桌面样例的完整 PNG 从 1,347,696 bytes 降到
 1,106,338 bytes（约减少 18%），编码也从 8.8ms 降到 6.6ms；tile diff 同样受益。
 
-tmux 下的 refined frame 以约 275ms 为单帧传输预算；默认 40 Mbit/s 时约为 1.38 MB。
-如果视频或大面积动画令无损 PNG
-超过预算，会按编码后的实际大小直接降到 900p/720p/540p/360p 中合适的一档，而不是先把
-超大帧塞进 tmux；modeline 显示当前档位。画面静止 2 秒后逐档恢复，避免动画期间反复抖动，
-同时让停止后的文字自动回到最高精度。navigation atlas 始终保留清晰的 1080p 全局预览。
+tmux 下的持续 damage frame 默认以约 275ms 为单帧传输预算；40 Mbit/s 时约为 1.38 MB。
+如果视频或大面积动画令无损 PNG 超过预算，会按编码后的实际大小降低分辨率，而不是先把
+超大帧塞进 tmux；状态栏显示当前档位。默认的 `Auto` 模式让 zoom/pan 保持所选分辨率，只对
+持续变化的桌面自适应；`Sharp` 固定画质，`Fast` 则允许 navigation 一起自适应。画面静止
+2 秒后会直接恢复最高档，只发送一个高质量 keyframe，不再逐档重复传输。
 
 Kitty 协议输出使用非阻塞 PTY 和有序协议队列。atlas 的 4 KiB APC chunk 之间允许状态栏等
 普通终端控制插队，因此大图上传时也不会把交互锁死；只要图形队列尚未排空，replacement 就
@@ -119,7 +132,8 @@ PTY 输出、无法
 termway view --graphics kitty --tmux-bandwidth-mbps 40
 ```
 
-更快的中转可以提高该值，画质预算会随之同步增加；直连 Kitty 不使用这个限速参数。
+更快的中转可以提高该值，画质预算会随之同步增加；命令行参数覆盖配置文件，直连 Kitty
+不使用这个限速参数。
 
 可以显式选择或排错：
 
@@ -144,34 +158,29 @@ client 在 `auto` 模式下安全回退到 ANSI，避免声称支持基础 Kitty
 nix develop --command cargo run --release -- view
 ```
 
-键位：
+第一次使用只需要记住下面几项；任意时刻按 `?` 都能在程序内看到帮助：
 
-- 方向键或 `hjkl`：平移 viewport；
+- 鼠标左键：向点击位置移动并放大一级；
+- 鼠标滚轮、方向键或 `hjkl`：平移画面；
 - `+`/`-`：逐级缩放；
-- `1`–`9`：直接切换倍率；
 - `0`：返回 1× 全景并居中；
-- `c`：保持倍率并回到中心；
-- `r`：重新捕获当前画面；
-- 鼠标左键：向点击位置移动 viewport，并放大一级；
-- `MOUSE:ON` 时鼠标左键/右键：向远端桌面发送对应点击；
-- 鼠标滚轮或触控板上下滚动：垂直平移 viewport；
-- 触控板左右滚动：水平平移 viewport（取决于终端是否发送水平滚动事件）；
-- `s`（需要 `--control`）：切换滚动控制 viewport 或远端桌面；
-- `a`（需要 `--control`）：切换是否阻止远端桌面进入 idle；
-- `x`：打开配置驱动的 action palette；
-- `q`、Esc、Ctrl-C、Ctrl-D：退出。
+- `g`：打开显示设置，调整 `Quality` 和 `Resolution`；
+- `q`：退出。
+
+显示设置中用 `↑`/`↓` 选项目、`←`/`→` 改值、Enter 或 Esc 关闭。更多控制（直接倍率、
+远端输入、action palette、刷新等）放在 `?` 帮助中，不要求预先记忆。
 
 鼠标事件使用终端的 SGR mouse protocol。tmux 会把事件转换成 pane 内坐标，因此 pane
 在 window 中的位置不需要额外补偿；图像右侧/下方留白和状态栏中的点击会被忽略。
 
 viewer 有两个互斥交互模式，鼠标控制则是独立的安全开关：
 
-| mode line | 键盘 | 左键 | 右键 |
+| 状态栏 | 键盘 | 左键 | 右键 |
 | --- | --- | --- | --- |
-| `NAV \| READ-ONLY` | termway 导航命令 | 渐进聚焦并放大 | 无操作 |
-| `NAV \| MOUSE:OFF` | termway 导航命令 | 渐进聚焦并放大 | 无操作 |
-| `INPUT \| MOUSE:OFF` | 发送给远端窗口 | 渐进聚焦并放大 | 无操作 |
-| `NAV/INPUT \| MOUSE:ON` | 取决于 NAV/INPUT | 远端左键 | 远端右键 |
+| `Navigation · View only` | termway 导航命令 | 渐进聚焦并放大 | 无操作 |
+| `Navigation · Mouse off` | termway 导航命令 | 渐进聚焦并放大 | 无操作 |
+| `Keyboard · Mouse off` | 发送给远端窗口 | 渐进聚焦并放大 | 无操作 |
+| `Mouse on` | 取决于 Navigation/Keyboard | 远端左键 | 远端右键 |
 
 `--control` 只授予远端输入能力，并不是一种运行模式：
 
@@ -179,22 +188,24 @@ viewer 有两个互斥交互模式，鼠标控制则是独立的安全开关：
 nix develop --command cargo run --release -- view --control
 ```
 
-启动时为 `[NAV | MOUSE:OFF | SCROLL:VIEW]`。在 NAV 中按 `i` 切换 `MOUSE:OFF/ON`；只有
-`MOUSE:ON` 状态下的左键或右键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
+启动时为 `Navigation · Mouse off`。在 Navigation 中按 `i` 切换鼠标控制；只有
+`Mouse on` 状态下的左键或右键按下才会通过 niri 提供的 wlr virtual pointer 协议发送，
 点击后会自动刷新一帧。该路径使用 Wayland 绝对坐标，不依赖 `ydotool`、`/dev/uinput`
 或鼠标加速度。当前输入映射仅支持 niri 的 `Normal` output transform。
 
-在 `--control` 模式下按 `t` 进入 `[INPUT]`，键盘事件会通过 Wayland virtual
+在 `--control` 模式下按 `t` 进入 `Keyboard`，键盘事件会通过 Wayland virtual
 keyboard 发送给当前聚焦的远端窗口。输入模式使用 `Ctrl-\` 作为 termway 前缀：
 
 - `Ctrl-\ t`：返回 command mode；
 - `Ctrl-\ r`：刷新画面；
 - `Ctrl-\ q`：退出 termway；
-- `Ctrl-\ i`：切换 `MOUSE:OFF/ON`；
-- `Ctrl-\ s`：切换 `SCROLL:VIEW/DESKTOP`；
+- `Ctrl-\ i`：切换鼠标控制；
+- `Ctrl-\ s`：切换滚动控制本地画面或远端桌面；
 - `Ctrl-\ a`：切换远端 idle inhibit；
 - `Ctrl-\ x`：打开 action palette；
-- `Ctrl-\` 后接 `+`、`-`、`0`–`9`、`c`、方向键或 `hjkl`：在 INPUT
+- `Ctrl-\ g`：打开显示设置；
+- `Ctrl-\ ?`：显示帮助；
+- `Ctrl-\` 后接 `+`、`-`、`0`–`9`、`c`、方向键或 `hjkl`：在 Keyboard
   模式中缩放、复位或平移 viewport；
 - 连按两次 `Ctrl-\`：向远端发送一次 `Ctrl-\`。
 
@@ -209,12 +220,30 @@ Mac 的 Option 可以在终端配置允许时作为 Alt 发送；Command/Super �
 无法可靠穿过 SSH。Wayland virtual keyboard 可以把组合键发给聚焦应用，但不能触发
 niri 的 compositor-global bindings；这类入口适合放进 action palette。
 
-`view --control` 默认通过 `org.freedesktop.ScreenSaver` 阻止远端进入 idle，modeline
-显示 `IDLE:BLOCK`。退出 viewer 会自动解除；如果要把 viewer 留在 detach 的 tmux pane
-中并允许正常锁屏，请先按 `a`（INPUT 中按 `Ctrl-\ a`）切到 `IDLE:NORMAL`。只读 viewer
+`view --control` 默认通过 `org.freedesktop.ScreenSaver` 阻止远端进入 idle，状态栏
+显示 `Keep awake`。退出 viewer 会自动解除；如果要把 viewer 留在 detach 的 tmux pane
+中并允许正常锁屏，请先按 `a`（Keyboard 中按 `Ctrl-\ a`）关闭该状态。只读 viewer
 不会改变 idle 行为。
 
-## Action palette
+## 配置
+
+配置文件是可选的；没有配置时 `termway view` 直接使用聚焦屏幕、1080p 和推荐的 `Auto`
+策略。普通用户通常只需要下面三个字段：
+
+```toml
+output = "eDP-1" # 可省略；省略后使用 niri focused output
+
+[graphics]
+quality = "auto"          # auto（推荐）/ sharp / fast
+resolution = "2560x1600" # 也支持 720p、1080p、1440p、4k、native
+```
+
+`quality` 与程序内 `g` 菜单完全对应：`auto` 仅在持续画面变化时降档，`sharp` 永不自适应，
+`fast` 在链路紧张时也允许缩放/平移帧降档。运行时修改只影响当前会话，配置文件仍是下次
+启动的默认值。带宽、恢复时间等细粒度参数集中放在可选的 `[graphics.advanced]` 中，见
+[`examples/config.toml`](examples/config.toml) 后半部分。
+
+### Action palette
 
 termway 不内建任何 niri action。palette 完全由配置文件驱动，每个条目都是一个普通
 argv command，因此也可以用于其他 compositor、脚本或任意程序。默认读取：
@@ -229,7 +258,7 @@ argv command，因此也可以用于其他 compositor、脚本或任意程序。
 termway --config /path/to/config.toml view --control
 ```
 
-完整示例见 [`examples/config.toml`](examples/config.toml)，可这样安装：
+示例配置可这样安装：
 
 ```console
 mkdir -p ~/.config/termway
@@ -237,33 +266,33 @@ cp examples/config.toml ~/.config/termway/config.toml
 ```
 
 示例根据当前 niri 配置提供 Kitty、Noctalia launcher/clipboard、Dolphin、Chrome，以及
-overview、窗口和工作区操作。niri 项也只是普通命令，例如：
+overview、窗口焦点/关闭/浮动、工作区操作。窗口焦点项包括左右列、上下窗口和上一窗口，例如：
 
 ```toml
 [[actions]]
-name = "overview"
-description = "Toggle the niri overview"
-command = ["niri", "msg", "action", "toggle-overview"]
+name = "focus-window-previous"
+description = "Focus the previously focused niri window"
+command = ["niri", "msg", "action", "focus-window-previous"]
 ```
 
-在 NAV 中按 `x`，或在 INPUT 中按 `Ctrl-\ x` 打开。输入字符过滤 name 和
+在 Navigation 中按 `x`，或在 Keyboard 中按 `Ctrl-\ x` 打开。输入字符过滤 name 和
 description；Tab/Down 与 BackTab/Up 切换候选，Enter 执行，Esc 或 Ctrl-G 取消。
 termway 会为子进程补齐已发现的 `XDG_RUNTIME_DIR`、`WAYLAND_DISPLAY`、
 `NIRI_SOCKET`，并从本地图形会话补齐 `DISPLAY`、session D-Bus 等桌面环境变量；因此
 从 SSH 启动 Chrome 这类应用时不会错误继承 SSH 会话。配置缺失时 viewer 仍可正常使用，
 只会在打开 palette 时给出提示。
 
-滚动目标独立于 NAV/INPUT 和点击安全开关。默认 `SCROLL:VIEW` 保留触控板导航体验；
-切到 `SCROLL:DESKTOP` 后，termway 会将滚动位置映射到远端 output，再通过 wlr virtual
+滚动目标独立于 Navigation/Keyboard 和点击安全开关。默认滚动本地画面，保留触控板导航体验；
+切到远端桌面后，termway 会将滚动位置映射到远端 output，再通过 wlr virtual
 pointer 发送水平或垂直 wheel axis。滚动仍使用事件合并、手势轴锁和每帧限幅。
 原生 damage watcher 可用时，键盘输入和点击产生的画面变化由 compositor 自动报告，
 不会额外发起前台 capture。回退到 grim 或 watcher 运行失败时，键盘输入会启用 250ms
 debounce，点击后也会主动捕获，维持相同的基本交互能力。显式 `Ctrl-\ r` 始终强制立即
 捕获当前画面，作为手动刷新和恢复手段。
 
-底部采用 Emacs 式两层信息区：mode line 持续显示当前模式、输出、倍率和 viewport；
-echo area 显示刷新结果、点击坐标和错误。普通消息 2 秒后自动清空，错误保留 5 秒，
-不会覆盖 mode line 中的控制状态。
+底部采用两层信息区：状态栏只显示当前屏幕、交互模式、倍率、实际画质和需要注意的控制
+状态，并始终保留 `? Help` 入口；第二行显示操作结果、错误以及上下文设置。普通消息 2 秒
+后自动清空，错误保留 5 秒，不会覆盖状态栏中的安全状态。
 
 高频滚动采用短窗口事件合并，只为一批输入重绘一帧；一次连续手势会锁定最初的
 主导轴，过滤触控板的交叉轴噪声。持续的交叉轴输入可以突破锁定，短暂停顿也会自动

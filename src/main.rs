@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     niri_socket: Option<PathBuf>,
 
-    /// Read actions from this file instead of the default XDG config path.
+    /// Read settings and actions from this file instead of the default XDG config path.
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -42,7 +42,7 @@ enum Command {
     },
     /// Capture one frame and render it with truecolor half-blocks.
     Capture {
-        /// Capture this output instead of niri's focused output.
+        /// Capture this output instead of the configured or focused output.
         #[arg(short, long)]
         output: Option<String>,
 
@@ -68,7 +68,7 @@ enum Command {
     },
     /// Interactively pan and zoom a captured output.
     View {
-        /// View this output instead of niri's focused output.
+        /// View this output instead of the configured or focused output.
         #[arg(short, long)]
         output: Option<String>,
 
@@ -93,8 +93,9 @@ enum Command {
         graphics: kitty::GraphicsMode,
 
         /// Pace Kitty image output inside tmux to this relay bandwidth.
-        #[arg(long, default_value_t = 40.0, value_name = "MBPS")]
-        tmux_bandwidth_mbps: f64,
+        /// Overrides `graphics.advanced.tmux_bandwidth_mbps` from the config file.
+        #[arg(long, value_name = "MBPS")]
+        tmux_bandwidth_mbps: Option<f64>,
     },
     /// Render a deterministic Kitty transition for automated visual regression tests.
     #[command(hide = true)]
@@ -108,6 +109,14 @@ enum Command {
     QualityFixture {
         #[arg(long, default_value_t = 40.0, value_name = "MBPS")]
         tmux_bandwidth_mbps: f64,
+
+        /// Override preview dwell time to make stale-atlas regressions deterministic.
+        #[arg(long, default_value_t = 120, value_name = "MILLISECONDS")]
+        refine_delay_ms: u64,
+
+        /// Override idle atlas refresh time to keep stale-atlas fixtures deterministic.
+        #[arg(long, default_value_t = 2000, value_name = "MILLISECONDS")]
+        atlas_refresh_ms: u64,
     },
 }
 
@@ -118,9 +127,15 @@ fn main() -> Result<()> {
     }
     if let Some(Command::QualityFixture {
         tmux_bandwidth_mbps,
+        refine_delay_ms,
+        atlas_refresh_ms,
     }) = cli.command.as_ref()
     {
-        return viewer::run_quality_fixture(*tmux_bandwidth_mbps);
+        return viewer::run_quality_fixture(
+            *tmux_bandwidth_mbps,
+            Duration::from_millis(*refine_delay_ms),
+            Duration::from_millis(*atlas_refresh_ms),
+        );
     }
     let config = config::load(cli.config.as_deref())?;
     let discovered = discovery::discover(cli.niri_socket.as_deref())?;
@@ -135,7 +150,15 @@ fn main() -> Result<()> {
             zoom,
             center_x,
             center_y,
-        } => capture(discovered, output, cols, rows, zoom, center_x, center_y),
+        } => capture(
+            discovered,
+            output.or_else(|| config.output.clone()),
+            cols,
+            rows,
+            zoom,
+            center_x,
+            center_y,
+        ),
         Command::View {
             output,
             zoom,
@@ -144,21 +167,28 @@ fn main() -> Result<()> {
             control,
             graphics,
             tmux_bandwidth_mbps,
-        } => view(
-            discovered,
-            ViewOptions {
-                output,
-                viewport: render::Viewport {
-                    zoom,
-                    center_x,
-                    center_y,
+        } => {
+            let mut graphics_config = config.graphics;
+            if let Some(tmux_bandwidth_mbps) = tmux_bandwidth_mbps {
+                graphics_config.advanced.tmux_bandwidth_mbps = tmux_bandwidth_mbps;
+                graphics_config.validate()?;
+            }
+            view(
+                discovered,
+                ViewOptions {
+                    output: output.or(config.output),
+                    viewport: render::Viewport {
+                        zoom,
+                        center_x,
+                        center_y,
+                    },
+                    control,
+                    graphics,
+                    graphics_config,
+                    actions: config.actions,
                 },
-                control,
-                graphics,
-                tmux_bandwidth_mbps,
-                actions: config.actions,
-            },
-        ),
+            )
+        }
         Command::GraphicsFixture { .. } => {
             unreachable!("graphics fixture returned before discovery")
         }
@@ -173,7 +203,7 @@ struct ViewOptions {
     viewport: render::Viewport,
     control: bool,
     graphics: kitty::GraphicsMode,
-    tmux_bandwidth_mbps: f64,
+    graphics_config: config::GraphicsConfig,
     actions: Vec<config::Action>,
 }
 
@@ -192,7 +222,7 @@ fn view(discovered: discovery::GraphicalSession, options: ViewOptions) -> Result
         viewer::RunOptions {
             control: options.control,
             graphics: options.graphics,
-            tmux_bandwidth_mbps: options.tmux_bandwidth_mbps,
+            graphics_config: options.graphics_config,
             initial_viewport: options.viewport,
             actions: options.actions,
             niri_socket: &discovered.socket_path,
@@ -279,6 +309,8 @@ fn resolve_output(
 fn doctor(discovered: discovery::GraphicalSession) -> Result<()> {
     let mut client = niri::Client::connect(&discovered.socket_path)?;
     let snapshot = client.snapshot()?;
+    let focused_output = client.focused_output_name()?;
+    let outputs = client.output_geometries()?;
 
     println!("termway doctor");
     println!("  runtime directory : {}", discovered.runtime_dir.display());
@@ -292,7 +324,29 @@ fn doctor(discovered: discovery::GraphicalSession) -> Result<()> {
             .unwrap_or("not discovered")
     );
     println!("  niri version      : {}", snapshot.version);
-    println!("  outputs           : {}", snapshot.output_count);
+    println!(
+        "  outputs           : {} ({} enabled)",
+        snapshot.output_count,
+        outputs.len()
+    );
+    for output in outputs {
+        let focused = if focused_output.as_deref() == Some(output.name.as_str()) {
+            " focused"
+        } else {
+            ""
+        };
+        println!(
+            "    {}{}: {}x{} at {:+},{:+}, scale {}, transform {}",
+            output.name,
+            focused,
+            output.width,
+            output.height,
+            output.x,
+            output.y,
+            output.scale,
+            output.transform
+        );
+    }
     println!("  windows           : {}", snapshot.window_count);
     println!(
         "  focused window    : {}",

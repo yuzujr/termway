@@ -28,12 +28,25 @@ src/
   capture.rs     damage watcher、原生捕获与 grim fallback
   input.rs       Wayland virtual pointer/keyboard
   niri.rs        JSON IPC 与 output geometry
-  config.rs      action palette 配置和进程环境
+  config.rs      用户画质配置、action palette 和进程环境
   idle.rs        ScreenSaver D-Bus inhibitor
 ```
 
 捕获 viewport、terminal cell 和 niri output logical coordinates 通过显式结构传递，点击映射
 先回到 capture source pixel，再映射到 output logical coordinate。
+
+## 交互设计约束
+
+termway 是一个短时进入、随用随走的工具，界面采用渐进披露，不要求用户记住完整状态机：
+
+- 无配置即可启动；默认选择 focused output、1080p 和 `Auto` 画质；
+- 常驻状态栏只回答“我在哪块屏、当前能做什么、画质如何”，不显示内部坐标和网格尺寸；
+- `?` 是所有控制的统一发现入口，`g` 是画质与分辨率的唯一入口；设置行同时显示值、含义和
+  当前可用方向键，避免把 renderer 参数变成快捷键；
+- 配置文件复用界面中的 `quality` / `resolution` 词汇；damage 阈值、传输预算和恢复时间属于
+  高级调优，默认示例不启用；
+- 程序内调整只影响当前会话，避免一次试调意外修改持久配置；安全相关状态（远端鼠标、
+  Keyboard 模式、idle inhibit）始终可见。
 
 ## 运行模式
 
@@ -47,6 +60,11 @@ output，并跨帧复用 `wl_shm` buffer；协议不可用时回退到 grim。zo
 latest-frame 槽，因此 SSH 输出慢时不会积压帧。手动 capture 仍走独立的立即返回路径，
 不会在静止画面上等待 damage。
 
+viewer 在启动时解析一个目标 output：命令行优先于配置文件，二者都未指定时使用 niri
+focused output。screencopy、damage watcher、几何映射和 virtual pointer 都绑定同一个
+`wl_output`，因此普通方向的不同 scale/负逻辑坐标互不混用。当前生命周期内不会切换 output，
+也不处理 output 热插拔或非 `Normal` transform；全桌面拼接不在现有模型中。
+
 ANSI 重绘采用以下策略：
 
 - 不在帧开始时清空屏幕，而是以新图直接覆盖旧图；
@@ -55,11 +73,15 @@ ANSI 重绘采用以下策略：
 - 边界按键和其他无状态变化的事件不触发绘制；
 - 连续 cell 复用 ANSI 颜色状态，damage 帧只发送变化 run。
 
-Kitty 模式缓存 1080p navigation atlas，zoom/pan 只发送 source-crop placement；120ms idle
-后用 128px cell-aligned tile refine。tmux 路径用单个 Unicode placeholder 建立 pane 锚点，
+Kitty 模式缓存可配置分辨率的 navigation atlas；内容仍新鲜时，zoom/pan 只发送 source-crop
+placement，默认 120ms idle 后用 128px cell-aligned tile refine。desktop damage 会令 atlas
+失效，此时导航跳过旧 crop 和 120ms 延迟，直接从最新捕获帧生成 tile；画面静止 2 秒后在
+任意 viewport 重建 atlas。tmux 路径用单个 Unicode placeholder 建立 pane 锚点，
 atlas/tile 通过 relative placement 定位；crop 切换以 synchronized update 原子提交。输出
-仍限制 burst，并按配置带宽和实际 PNG 大小选择 1080p–360p；fresh atlas 上只允许分辨率更高
-的 refine 覆盖，静止后逐档恢复。atlas 的 4 KiB APC chunk 可独立调度普通终端控制；图形队列
+仍限制 burst；一次性 navigation refine 默认保持最高配置分辨率，只有在配置时间窗内达到
+连续 damage 帧阈值后才按配置带宽和实际 PNG 大小降档。静止恢复 redraw 会强制最高档，避免
+刚恢复就在同一帧被再次降档。fresh atlas 上只允许分辨率更高的 refine 覆盖。
+atlas 的 4 KiB APC chunk 可独立调度普通终端控制；图形队列
 未排空时保留旧 chunk，再追加 replacement，避免留下未完成的 `m=1` 上传。
 
 ### Control mode

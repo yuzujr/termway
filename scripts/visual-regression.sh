@@ -24,6 +24,16 @@ for command in awk cargo cmp grim jq kitty magick niri tmux; do
     fi
 done
 
+if command -v loginctl >/dev/null; then
+    graphical_session=$(loginctl list-sessions --no-legend 2>/dev/null \
+        | awk '$4 == "seat0" { print $1; exit }')
+    if [[ -n $graphical_session ]] \
+        && [[ $(loginctl show-session "$graphical_session" -p LockedHint --value 2>/dev/null) == yes ]]; then
+        echo "visual regression: graphical session is locked; unlock it before running pixel checks" >&2
+        exit 2
+    fi
+fi
+
 declare -a kitty_sockets=()
 declare -a tmux_servers=()
 
@@ -139,6 +149,105 @@ run_case() {
     echo "visual regression: $mode passed"
 }
 
+run_stale_atlas_case() {
+    local mode=$1
+    local socket="$temporary_dir/stale-$mode.sock"
+    local log="$artifact_dir/stale-$mode-kitty.log"
+    local title="termway-stale-$mode"
+    local tmux_server="termway-visual-$PPID-stale-$mode"
+    kitty_sockets+=("$socket")
+
+    if [[ $mode == direct ]]; then
+        WAYLAND_DISPLAY="$wayland_display" kitty --detach --start-as=fullscreen \
+            --detached-log="$log" --listen-on="unix:$socket" \
+            -o allow_remote_control=yes --class termway-vtest --title "$title" \
+            env -u TMUX -u TMUX_PANE "$binary" quality-fixture \
+            --tmux-bandwidth-mbps 40 --refine-delay-ms 750 --atlas-refresh-ms 10000
+    else
+        tmux_servers+=("$tmux_server")
+        WAYLAND_DISPLAY="$wayland_display" kitty --detach --start-as=fullscreen \
+            --detached-log="$log" --listen-on="unix:$socket" \
+            -o allow_remote_control=yes --class termway-vtest --title "$title" \
+            tmux -L "$tmux_server" -f /dev/null new-session \
+            "tmux set-option -g allow-passthrough all; exec '$binary' quality-fixture --tmux-bandwidth-mbps 40 --refine-delay-ms 750 --atlas-refresh-ms 10000"
+    fi
+    wait_for_kitty "$socket"
+
+    local attempt screen_text=""
+    for attempt in $(seq 1 200); do
+        screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
+        if [[ $screen_text == *'1.00×'* ]]; then
+            break
+        fi
+        sleep 0.01
+    done
+    if [[ $screen_text != *'1.00×'* ]]; then
+        echo "visual regression: $mode stale-atlas fixture did not initialize" >&2
+        return 1
+    fi
+    # The modeline can arrive before the initial atlas payload and fullscreen resize settle.
+    # Inject damage only after both direct and paced tmux transports have had time to finish it.
+    sleep 0.7
+
+    # Replace the detailed initial frame with magenta tiles while deliberately leaving its atlas
+    # stale. The extended fixture delay gives an incorrect cached preview a stable 750ms window.
+    kitty @ --to "unix:$socket" send-key --match all d
+    local state=invalid current=""
+    for attempt in $(seq 1 40); do
+        current="$artifact_dir/stale-$mode-current.png"
+        XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
+            WAYLAND_DISPLAY="$wayland_display" grim -o "$output_name" "$current"
+        state=$(classify_frame "$current")
+        if [[ $state == magenta ]]; then
+            break
+        fi
+        sleep 0.01
+    done
+    if [[ $state != magenta ]]; then
+        echo "visual regression: $mode stale-atlas fixture did not display its current frame" >&2
+        return 1
+    fi
+
+    kitty @ --to "unix:$socket" send-key --match all plus
+    screen_text=""
+    for attempt in $(seq 1 100); do
+        screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
+        if [[ $screen_text == *'1.25×'* ]]; then
+            break
+        fi
+        sleep 0.01
+    done
+    if [[ $screen_text != *'1.25×'* ]]; then
+        echo "visual regression: $mode stale-atlas fixture did not navigate" >&2
+        return 1
+    fi
+    if [[ $screen_text == *'loading'* ]]; then
+        echo "visual regression: $mode entered preview with a stale atlas" >&2
+        return 1
+    fi
+
+    local frame frame_number screenshot
+    for frame_number in $(seq 0 5); do
+        frame=$(printf '%02d' "$frame_number")
+        screenshot="$artifact_dir/stale-$mode-transition-$frame.png"
+        XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
+            WAYLAND_DISPLAY="$wayland_display" grim -o "$output_name" "$screenshot"
+        if [[ $(classify_frame "$screenshot") != magenta ]]; then
+            echo "visual regression: $mode exposed stale atlas pixels: $screenshot" >&2
+            return 1
+        fi
+    done
+
+    magick "$current" "$artifact_dir/stale-$mode-transition-00.png" \
+        "$artifact_dir/stale-$mode-transition-05.png" -thumbnail 512x320 \
+        -gravity center -extent 512x320 +append "$artifact_dir/stale-$mode-montage.png"
+    kitty @ --to "unix:$socket" send-key --match all q >/dev/null 2>&1 || true
+    sleep 0.2
+    kitty @ --to "unix:$socket" close-window --match all >/dev/null 2>&1 || true
+    sleep 0.2
+    echo "visual regression: $mode stale atlas passed"
+}
+
 run_quality_case() {
     local socket="$temporary_dir/quality.sock"
     local log="$artifact_dir/quality-kitty.log"
@@ -155,12 +264,12 @@ run_quality_case() {
     local attempt screen_text=""
     for attempt in $(seq 1 200); do
         screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
-        if [[ $screen_text == *'1.00x'* ]]; then
+        if [[ $screen_text == *'1.00×'* ]]; then
             break
         fi
         sleep 0.01
     done
-    if [[ $screen_text != *'1.00x'* ]]; then
+    if [[ $screen_text != *'1.00×'* ]]; then
         echo "visual regression: quality fixture did not initialize" >&2
         return 1
     fi
@@ -170,12 +279,12 @@ run_quality_case() {
     kitty @ --to "unix:$socket" send-key --match all plus
     for attempt in $(seq 1 100); do
         screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
-        if [[ $screen_text == *'1.25x'* ]]; then
+        if [[ $screen_text == *'1.25×'* ]]; then
             break
         fi
         sleep 0.01
     done
-    if [[ $screen_text != *'1.25x'* ]]; then
+    if [[ $screen_text != *'1.25×'* ]]; then
         echo "visual regression: viewport control was blocked behind the atlas upload" >&2
         return 1
     fi
@@ -192,12 +301,12 @@ run_quality_case() {
     screen_text=""
     for attempt in $(seq 1 100); do
         screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen 2>/dev/null || true)
-        if [[ $screen_text == *'1.00x'* && $screen_text == *'KITTY/PREVIEW'* ]]; then
+        if [[ $screen_text == *'1.00×'* && $screen_text == *'1080p loading'* ]]; then
             break
         fi
         sleep 0.01
     done
-    if [[ $screen_text != *'1.00x'* || $screen_text != *'KITTY/PREVIEW'* ]]; then
+    if [[ $screen_text != *'1.00×'* || $screen_text != *'1080p loading'* ]]; then
         echo "visual regression: quality fixture did not reach the 1x atlas preview" >&2
         return 1
     fi
@@ -210,7 +319,7 @@ run_quality_case() {
     XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
         WAYLAND_DISPLAY="$wayland_display" grim -o "$output_name" "$final"
     screen_text=$(kitty @ --to "unix:$socket" get-text --match all --extent screen)
-    if [[ $screen_text != *'1.00x'* || $screen_text != *'GFX:KITTY/1080p'* ]]; then
+    if [[ $screen_text != *'1.00×'* || $screen_text != *'1080p Fast'* ]]; then
         echo "visual regression: quality fixture did not settle at the full-resolution atlas" >&2
         return 1
     fi
@@ -236,5 +345,7 @@ run_quality_case() {
 
 run_case direct
 run_case tmux
+run_stale_atlas_case direct
+run_stale_atlas_case tmux
 run_quality_case
 echo "visual regression: artifacts saved in $artifact_dir"

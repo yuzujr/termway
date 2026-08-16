@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{collections::VecDeque, mem};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
@@ -21,7 +21,7 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
 
 use crate::capture;
-use crate::config::{Action, ActionRunner};
+use crate::config::{Action, ActionRunner, GraphicsConfig, QualityMode};
 use crate::idle::IdleInhibitor;
 use crate::input::{PointerButton, VirtualKeyboard, VirtualPointer};
 use crate::kitty::{self, GraphicsMode};
@@ -42,15 +42,8 @@ const AXIS_SWITCH_THRESHOLD: i32 = 2;
 const AUTO_REFRESH_DELAY: Duration = Duration::from_millis(250);
 const CLICK_FOCUS_FRACTION: f32 = 0.4;
 const DAMAGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
-const KITTY_MAX_WIDTH: u32 = 1920;
-const KITTY_MAX_HEIGHT: u32 = 1080;
 const KITTY_TILE_SIZE: u32 = 128;
 const KITTY_COLOR_BITS: u8 = 7;
-const KITTY_REFINE_DELAY: Duration = Duration::from_millis(120);
-const KITTY_QUALITY_HEIGHTS: &[u32] = &[1080, 900, 720, 540, 360];
-const KITTY_FRAME_BUDGET: Duration = Duration::from_millis(275);
-const KITTY_QUALITY_RECOVERY_DELAY: Duration = Duration::from_secs(2);
-const KITTY_ATLAS_REFRESH_DELAY: Duration = Duration::from_secs(2);
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 // Keep tmux's eager pane reader from building a multi-megabyte client backlog. This is below a
 // 50 Mbit/s relay while remaining fast enough to deliver a typical UI frame in well under a
@@ -60,16 +53,20 @@ const TMUX_GRAPHICS_BURST_BYTES: f64 = 16.0 * 1024.0;
 pub struct RunOptions<'a> {
     pub control: bool,
     pub graphics: GraphicsMode,
-    pub tmux_bandwidth_mbps: f64,
+    pub graphics_config: GraphicsConfig,
     pub initial_viewport: Viewport,
     pub actions: Vec<Action>,
     pub niri_socket: &'a Path,
     pub environment: &'a [(OsString, OsString)],
 }
 
-/// Developer-only end-to-end fixture for the Kitty atlas/refine quality policy.
-pub fn run_quality_fixture(tmux_bandwidth_mbps: f64) -> Result<()> {
-    let frame = RgbImage::from_fn(2560, 1600, |x, y| {
+/// Developer-only end-to-end fixture for Kitty quality and stale-atlas navigation policy.
+pub fn run_quality_fixture(
+    tmux_bandwidth_mbps: f64,
+    refine_delay: Duration,
+    atlas_refresh_delay: Duration,
+) -> Result<()> {
+    let mut frame = RgbImage::from_fn(2560, 1600, |x, y| {
         // Small deterministic noise blocks keep this fixture visually detailed and, crucially,
         // expensive to PNG-compress. Flat colors and regular checkerboards made multi-megabyte
         // output scheduling regressions invisible to the end-to-end test.
@@ -86,7 +83,16 @@ pub fn run_quality_fixture(tmux_bandwidth_mbps: f64) -> Result<()> {
         image::Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
     });
     let mut state = ViewerState::new(Viewport::default(), false)?;
-    let mut terminal = Terminal::enter(GraphicsMode::Kitty, tmux_bandwidth_mbps)?;
+    let mut graphics_config = GraphicsConfig::default();
+    graphics_config.advanced.tmux_bandwidth_mbps = tmux_bandwidth_mbps;
+    graphics_config.advanced.preview_ms = refine_delay.as_millis().try_into().unwrap_or(u64::MAX);
+    graphics_config.advanced.atlas_refresh_ms = atlas_refresh_delay
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    // The quality fixture intentionally exercises adaptive tiers on navigation.
+    graphics_config.quality = QualityMode::Fast;
+    let mut terminal = Terminal::enter(GraphicsMode::Kitty, graphics_config)?;
     state.graphics_backend = terminal.backend_name();
     let mut layout = terminal.draw(&frame, "quality-fixture", &state)?;
 
@@ -117,10 +123,19 @@ pub fn run_quality_fixture(tmux_bandwidth_mbps: f64) -> Result<()> {
 
         match event::read().context("cannot read quality fixture input")? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if key.code == KeyCode::Char('d') {
+                    // Turn the cached atlas stale while putting an unmistakable current frame on
+                    // screen. The visual regression then navigates before the idle keyframe is
+                    // rebuilt and verifies that this old atlas is never exposed.
+                    frame = RgbImage::from_pixel(2560, 1600, image::Rgb([224, 32, 224]));
+                    terminal.note_visible_damage();
+                    layout = terminal.draw(&frame, "quality-fixture", &state)?;
+                    continue;
+                }
                 if key.code == KeyCode::Char('0') {
                     // Deterministically reproduce the result of tmux's bandwidth adaptation:
                     // returning to 1x must not let a 360p candidate cover a fresh 1080p atlas.
-                    terminal.kitty_quality.tier = KITTY_QUALITY_HEIGHTS.len() - 1;
+                    terminal.kitty_quality.select_lowest();
                     terminal.kitty_quality_upgrade_at = None;
                 }
                 match state.handle_key(key) {
@@ -195,7 +210,7 @@ pub fn run(
         .control
         .then(|| VirtualKeyboard::connect(runtime_dir, wayland_display))
         .transpose()?;
-    let mut terminal = Terminal::enter(options.graphics, options.tmux_bandwidth_mbps)?;
+    let mut terminal = Terminal::enter(options.graphics, options.graphics_config)?;
     state.graphics_backend = terminal.backend_name();
     if let Some(reason) = terminal.take_fallback_reason() {
         state.message(format!("Using ANSI graphics: {reason}"));
@@ -334,6 +349,15 @@ pub fn run(
                             }
                         }
                         terminal.draw_chrome(output_name, &state, layout)?;
+                    }
+                    Effect::Graphics(command) => {
+                        let (message, redraw) = terminal.apply_graphics_command(command);
+                        state.message(message);
+                        if redraw {
+                            layout = terminal.draw(&frame, output_name, &state)?;
+                        } else {
+                            terminal.draw_chrome(output_name, &state, layout)?;
+                        }
                     }
                     Effect::Redraw => layout = terminal.draw(&frame, output_name, &state)?,
                     Effect::Chrome => terminal.draw_chrome(output_name, &state, layout)?,
@@ -485,6 +509,7 @@ struct ViewerState {
     mode: InteractionMode,
     prefix_pending: bool,
     palette: Option<PaletteState>,
+    display_settings: Option<DisplaySettingsState>,
     actions: Vec<Action>,
     auto_refresh_at: Option<Instant>,
     scroll_gesture: ScrollGesture,
@@ -514,6 +539,18 @@ struct PaletteState {
     selected: usize,
 }
 
+#[derive(Debug, Default)]
+struct DisplaySettingsState {
+    selected: DisplaySetting,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum DisplaySetting {
+    #[default]
+    Quality,
+    Resolution,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Effect {
     None,
@@ -522,9 +559,18 @@ enum Effect {
     SendKey(EncodedKey),
     SendUnicode(char),
     RunAction(usize),
+    Graphics(GraphicsCommand),
     ToggleIdleInhibit,
     Refresh,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphicsCommand {
+    LowerResolution,
+    RaiseResolution,
+    PreviousQualityMode,
+    NextQualityMode,
 }
 
 impl ViewerState {
@@ -541,6 +587,7 @@ impl ViewerState {
             mode: InteractionMode::Nav,
             prefix_pending: false,
             palette: None,
+            display_settings: None,
             actions: Vec::new(),
             auto_refresh_at: None,
             scroll_gesture: ScrollGesture::default(),
@@ -550,6 +597,9 @@ impl ViewerState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Effect {
+        if self.display_settings.is_some() {
+            return self.handle_display_settings_key(key);
+        }
         if self.palette.is_some() {
             return self.handle_palette_key(key);
         }
@@ -583,6 +633,8 @@ impl ViewerState {
             KeyCode::Char('s') if self.control => self.toggle_scroll_target(),
             KeyCode::Char('a') if self.control => Effect::ToggleIdleInhibit,
             KeyCode::Char('x') => self.open_palette(),
+            KeyCode::Char('g') => self.open_display_settings(),
+            KeyCode::Char('?') => self.show_help(),
             _ => self.handle_view_command(key).unwrap_or(Effect::None),
         };
         if effect == Effect::Redraw {
@@ -620,11 +672,13 @@ impl ViewerState {
                 KeyCode::Char('s') => self.toggle_scroll_target(),
                 KeyCode::Char('a') => Effect::ToggleIdleInhibit,
                 KeyCode::Char('x') => self.open_palette(),
+                KeyCode::Char('g') => self.open_display_settings(),
+                KeyCode::Char('?') => self.show_help(),
                 _ => Effect::None,
             };
             if !matches!(
                 key.code,
-                KeyCode::Char('t' | 'q' | 'r' | 'i' | 's' | 'a' | 'x')
+                KeyCode::Char('t' | 'q' | 'r' | 'i' | 's' | 'a' | 'x' | 'g' | '?')
             ) {
                 if let Some(effect) = self.handle_view_command(key) {
                     return effect;
@@ -690,6 +744,59 @@ impl ViewerState {
         }
         self.message = None;
         self.palette = Some(PaletteState::default());
+        Effect::Chrome
+    }
+
+    fn open_display_settings(&mut self) -> Effect {
+        self.message = None;
+        self.display_settings = Some(DisplaySettingsState::default());
+        Effect::Chrome
+    }
+
+    fn handle_display_settings_key(&mut self, key: KeyEvent) -> Effect {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('g' | 'q')
+        ) {
+            self.display_settings = None;
+            self.message = None;
+            return Effect::Chrome;
+        }
+
+        let settings = self.display_settings.as_mut().unwrap();
+        match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                settings.selected = match settings.selected {
+                    DisplaySetting::Quality => DisplaySetting::Resolution,
+                    DisplaySetting::Resolution => DisplaySetting::Quality,
+                };
+                Effect::Chrome
+            }
+            KeyCode::Left | KeyCode::Char('h' | '-') => match settings.selected {
+                DisplaySetting::Quality => Effect::Graphics(GraphicsCommand::PreviousQualityMode),
+                DisplaySetting::Resolution => Effect::Graphics(GraphicsCommand::LowerResolution),
+            },
+            KeyCode::Right | KeyCode::Char('l' | '+' | '=') => match settings.selected {
+                DisplaySetting::Quality => Effect::Graphics(GraphicsCommand::NextQualityMode),
+                DisplaySetting::Resolution => Effect::Graphics(GraphicsCommand::RaiseResolution),
+            },
+            _ => Effect::None,
+        }
+    }
+
+    fn show_help(&mut self) -> Effect {
+        let help = match self.mode {
+            InteractionMode::Input => {
+                "Keys control the desktop · C-\\ ? help · C-\\ g display · C-\\ t navigation · C-\\ q quit"
+            }
+            InteractionMode::Nav if self.control => {
+                "Click/arrows move · +/- zoom · g display · t keyboard · i mouse · x actions · q quit"
+            }
+            InteractionMode::Nav => {
+                "Click/arrows move · +/- zoom · 0 overview · g display · x actions · r refresh · q quit"
+            }
+        };
+        self.message_for(help, ERROR_DURATION);
         Effect::Chrome
     }
 
@@ -1300,9 +1407,14 @@ struct Terminal {
     kitty_atlas_ready: bool,
     kitty_layout: Option<DrawLayout>,
     kitty_refine_at: Option<Instant>,
+    graphics_config: GraphicsConfig,
     kitty_quality: KittyQuality,
     kitty_frame_budget_bytes: usize,
     kitty_quality_upgrade_at: Option<Instant>,
+    kitty_force_max_quality: bool,
+    kitty_damage_streak: u32,
+    kitty_last_visible_damage_at: Option<Instant>,
+    kitty_adaptive_damage: bool,
     kitty_atlas_refresh_at: Option<Instant>,
     kitty_atlas_stale: bool,
     kitty_previewing: bool,
@@ -1313,10 +1425,8 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn enter(graphics: GraphicsMode, tmux_bandwidth_mbps: f64) -> Result<Self> {
-        if !tmux_bandwidth_mbps.is_finite() || tmux_bandwidth_mbps <= 0.0 {
-            bail!("--tmux-bandwidth-mbps must be a positive finite number");
-        }
+    fn enter(graphics: GraphicsMode, graphics_config: GraphicsConfig) -> Result<Self> {
+        graphics_config.validate()?;
         let (kitty, fallback_reason) = match kitty::Selection::select(graphics)? {
             kitty::Selection::Ansi { reason } => (None, reason),
             kitty::Selection::Kitty(renderer) => (Some(renderer), None),
@@ -1338,7 +1448,7 @@ impl Terminal {
             let graphics_rate = kitty
                 .as_ref()
                 .filter(|renderer| renderer.is_tmux())
-                .map(|_| tmux_bandwidth_mbps * 1_000_000.0 / 8.0);
+                .map(|_| graphics_config.advanced.tmux_bandwidth_mbps * 1_000_000.0 / 8.0);
             match OutputPump::new(&stdout, graphics_rate) {
                 Ok(output) => Some(output),
                 Err(error) => {
@@ -1351,6 +1461,16 @@ impl Terminal {
         } else {
             None
         };
+        let resolution = graphics_config.resolution;
+        let kitty_quality = KittyQuality::new(
+            resolution.width(),
+            resolution.height(),
+            graphics_config.advanced.adaptive_min_height,
+        );
+        let kitty_frame_budget_bytes = (graphics_config.advanced.tmux_bandwidth_mbps * 1_000_000.0
+            / 8.0
+            * Duration::from_millis(graphics_config.advanced.frame_budget_ms).as_secs_f64())
+            as usize;
         Ok(Self {
             stdout,
             kitty,
@@ -1362,10 +1482,14 @@ impl Terminal {
             kitty_atlas_ready: false,
             kitty_layout: None,
             kitty_refine_at: None,
-            kitty_quality: KittyQuality::default(),
-            kitty_frame_budget_bytes: (tmux_bandwidth_mbps * 1_000_000.0 / 8.0
-                * KITTY_FRAME_BUDGET.as_secs_f64()) as usize,
+            graphics_config,
+            kitty_quality,
+            kitty_frame_budget_bytes,
             kitty_quality_upgrade_at: None,
+            kitty_force_max_quality: false,
+            kitty_damage_streak: 0,
+            kitty_last_visible_damage_at: None,
+            kitty_adaptive_damage: false,
             kitty_atlas_refresh_at: None,
             kitty_atlas_stale: false,
             kitty_previewing: false,
@@ -1386,6 +1510,88 @@ impl Terminal {
 
     fn take_fallback_reason(&mut self) -> Option<String> {
         self.fallback_reason.take()
+    }
+
+    fn apply_graphics_command(&mut self, command: GraphicsCommand) -> (String, bool) {
+        if self.kitty.is_none() {
+            return (
+                "Runtime graphics controls require the Kitty backend".to_owned(),
+                false,
+            );
+        }
+        match command {
+            GraphicsCommand::LowerResolution => {
+                if !self.kitty_quality.lower_ceiling() {
+                    return (
+                        format!(
+                            "Resolution cap is already at its minimum ({})",
+                            self.kitty_quality.ceiling_label()
+                        ),
+                        false,
+                    );
+                }
+                self.prepare_quality_rebuild();
+                (
+                    format!(
+                        "Resolution cap lowered to {}",
+                        self.kitty_quality.ceiling_label()
+                    ),
+                    true,
+                )
+            }
+            GraphicsCommand::RaiseResolution => {
+                if !self.kitty_quality.raise_ceiling() {
+                    return (
+                        format!(
+                            "Resolution cap is already at its maximum ({})",
+                            self.kitty_quality.ceiling_label()
+                        ),
+                        false,
+                    );
+                }
+                self.prepare_quality_rebuild();
+                (
+                    format!(
+                        "Resolution cap raised to {}",
+                        self.kitty_quality.ceiling_label()
+                    ),
+                    true,
+                )
+            }
+            GraphicsCommand::PreviousQualityMode | GraphicsCommand::NextQualityMode => {
+                let current = self.graphics_config.quality;
+                let quality = if command == GraphicsCommand::PreviousQualityMode {
+                    current.previous()
+                } else {
+                    current.next()
+                };
+                self.graphics_config.quality = quality;
+                let redraw = if quality == QualityMode::Sharp {
+                    let redraw = !self.kitty_quality.is_maximum();
+                    self.kitty_quality.reset();
+                    self.kitty_quality_upgrade_at = None;
+                    self.kitty_damage_streak = 0;
+                    self.kitty_adaptive_damage = false;
+                    redraw
+                } else {
+                    false
+                };
+                (
+                    format!("Quality: {} — {}", quality.label(), quality.description()),
+                    redraw,
+                )
+            }
+        }
+    }
+
+    fn prepare_quality_rebuild(&mut self) {
+        self.kitty_quality_upgrade_at = None;
+        self.kitty_atlas_refresh_at = None;
+        self.kitty_refine_at = None;
+        self.kitty_force_max_quality = true;
+        self.kitty_damage_streak = 0;
+        self.kitty_adaptive_damage = false;
+        self.force_kitty_redraw = true;
     }
 
     fn invalidate_image(&mut self) {
@@ -1459,24 +1665,44 @@ impl Terminal {
             .is_some_and(|deadline| now >= deadline);
         if upgrade_due {
             self.kitty_quality_upgrade_at = None;
-            if self.kitty_quality.upgrade() && !self.kitty_quality.is_maximum() {
-                self.kitty_quality_upgrade_at = Some(now + KITTY_QUALITY_RECOVERY_DELAY);
-            }
+            // Once damage has stayed idle for the configured interval, one maximum-quality
+            // keyframe is cheaper and converges faster than retransmitting every intermediate
+            // tier at multi-second intervals.
+            self.kitty_quality.reset();
+            self.kitty_force_max_quality = true;
+            self.kitty_damage_streak = 0;
+            self.kitty_adaptive_damage = false;
         }
         refine_due || upgrade_due || atlas_due
     }
 
     fn note_frame_damage(&mut self) {
         self.kitty_atlas_stale = true;
-        if self.kitty_layout.is_some_and(DrawLayout::is_full_viewport) {
-            self.kitty_atlas_refresh_at = Some(Instant::now() + KITTY_ATLAS_REFRESH_DELAY);
+        if self.kitty_layout.is_some() {
+            self.kitty_atlas_refresh_at = Some(
+                Instant::now()
+                    + Duration::from_millis(self.graphics_config.advanced.atlas_refresh_ms),
+            );
         }
     }
 
     fn note_visible_damage(&mut self) {
+        let now = Instant::now();
+        let damage_window =
+            Duration::from_millis(self.graphics_config.advanced.adaptive_damage_window_ms);
+        self.kitty_damage_streak = next_damage_streak(
+            self.kitty_damage_streak,
+            self.kitty_last_visible_damage_at,
+            now,
+            damage_window,
+        );
+        self.kitty_last_visible_damage_at = Some(now);
+        self.kitty_adaptive_damage =
+            self.kitty_damage_streak >= self.graphics_config.advanced.adaptive_damage_frames;
         self.note_frame_damage();
         if !self.kitty_quality.is_maximum() {
-            self.kitty_quality_upgrade_at = Some(Instant::now() + KITTY_QUALITY_RECOVERY_DELAY);
+            self.kitty_quality_upgrade_at =
+                Some(now + Duration::from_millis(self.graphics_config.advanced.recovery_ms));
         }
     }
 
@@ -1578,10 +1804,6 @@ impl Terminal {
             source_width: frame.width(),
             source_height: frame.height(),
         };
-        if !layout.is_full_viewport() {
-            self.kitty_atlas_refresh_at = None;
-        }
-
         let atlas_compatible = self.kitty_atlas.as_ref().is_some_and(|atlas| {
             atlas.source_width == frame.width()
                 && atlas.source_height == frame.height()
@@ -1594,10 +1816,11 @@ impl Terminal {
             || !atlas_compatible
             || !self.kitty.as_ref().is_some_and(kitty::Renderer::has_atlas);
         if rebuild_atlas {
+            let (ceiling_width, ceiling_height) = self.kitty_quality.ceiling_limits();
             let mut atlas = render::render_raster_viewport(
                 frame,
-                display_pixel_width.min(KITTY_MAX_WIDTH),
-                display_pixel_height.min(KITTY_MAX_HEIGHT),
+                display_pixel_width.min(ceiling_width),
+                display_pixel_height.min(ceiling_height),
                 Viewport::default(),
             )?;
             atlas.image = render::align_raster_to_cell_grid(
@@ -1606,8 +1829,8 @@ impl Terminal {
                 layout.rows,
                 cell_width,
                 cell_height,
-                KITTY_MAX_WIDTH,
-                KITTY_MAX_HEIGHT,
+                ceiling_width,
+                ceiling_height,
             );
             render::reduce_color_precision(&mut atlas.image, KITTY_COLOR_BITS);
             let crop = render::map_viewport_to_raster(
@@ -1651,8 +1874,11 @@ impl Terminal {
             self.kitty_atlas_stale = false;
             self.kitty_atlas_refresh_at = None;
             self.kitty_layout = Some(layout);
-            self.kitty_refine_at = (!full_viewport).then(|| Instant::now() + KITTY_REFINE_DELAY);
+            self.kitty_refine_at = (!full_viewport).then(|| {
+                Instant::now() + Duration::from_millis(self.graphics_config.advanced.preview_ms)
+            });
             self.kitty_previewing = !full_viewport;
+            self.kitty_force_max_quality = false;
             self.force_kitty_redraw = false;
             self.deferred_kitty_redraw = false;
             self.last_image = None;
@@ -1661,39 +1887,58 @@ impl Terminal {
         }
 
         let viewport_changed = self.kitty_layout != Some(layout);
+        // A fresh-atlas preview records the new layout before its delayed refine, so the
+        // preview flag is also needed to distinguish that one-shot navigation frame from live
+        // desktop damage on an unchanged viewport.
+        let navigation_refine = viewport_changed || self.kitty_previewing;
         if viewport_changed {
-            if self.kitty_atlas_ready {
-                let atlas = self
-                    .kitty_atlas
-                    .as_ref()
-                    .expect("a ready Kitty atlas has metadata");
-                let crop = render::map_viewport_to_raster(
-                    layout.viewport,
-                    atlas.source_width,
-                    atlas.source_height,
-                    atlas.image_width,
-                    atlas.image_height,
-                );
-                let segments = self
-                    .kitty
-                    .as_mut()
-                    .expect("Kitty renderer was selected")
-                    .encode_atlas_placement(crop, layout.cols, layout.rows)?;
-                self.output_pump
-                    .as_mut()
-                    .expect("Kitty output pump was initialized")
-                    .replace_graphics(segments);
-                self.last_kitty_image = None;
-                self.kitty_layout = Some(layout);
-                self.kitty_refine_at = Some(Instant::now() + KITTY_REFINE_DELAY);
-                self.kitty_previewing = true;
-                self.deferred_kitty_redraw = false;
-            } else {
-                // An atlas placement is only valid once its complete upload reached Kitty.
-                self.deferred_kitty_redraw = true;
+            match atlas_navigation(self.kitty_atlas_ready, self.kitty_atlas_stale) {
+                AtlasNavigation::Preview => {
+                    let atlas = self
+                        .kitty_atlas
+                        .as_ref()
+                        .expect("a ready Kitty atlas has metadata");
+                    let crop = render::map_viewport_to_raster(
+                        layout.viewport,
+                        atlas.source_width,
+                        atlas.source_height,
+                        atlas.image_width,
+                        atlas.image_height,
+                    );
+                    let segments = self
+                        .kitty
+                        .as_mut()
+                        .expect("Kitty renderer was selected")
+                        .encode_atlas_placement(crop, layout.cols, layout.rows)?;
+                    self.output_pump
+                        .as_mut()
+                        .expect("Kitty output pump was initialized")
+                        .replace_graphics(segments);
+                    self.last_kitty_image = None;
+                    self.kitty_layout = Some(layout);
+                    self.kitty_refine_at = Some(
+                        Instant::now()
+                            + Duration::from_millis(self.graphics_config.advanced.preview_ms),
+                    );
+                    self.kitty_previewing = true;
+                    self.deferred_kitty_redraw = false;
+                    self.draw_chrome(output_name, state, layout)?;
+                    return Ok(layout);
+                }
+                AtlasNavigation::WaitForUpload => {
+                    // An atlas placement is only valid once its complete upload reached Kitty.
+                    self.deferred_kitty_redraw = true;
+                    self.draw_chrome(output_name, state, layout)?;
+                    return Ok(layout);
+                }
+                AtlasNavigation::RefineCurrentFrame => {
+                    // A cached crop is fast only while it is also truthful. Once desktop damage
+                    // makes the atlas stale, keep the current viewport on screen and start
+                    // replacing it directly with tiles rendered from the latest captured frame.
+                    self.kitty_refine_at = None;
+                    self.kitty_previewing = false;
+                }
             }
-            self.draw_chrome(output_name, state, layout)?;
-            return Ok(layout);
         }
 
         if self
@@ -1711,6 +1956,19 @@ impl Terminal {
             self.deferred_kitty_redraw = true;
             self.draw_chrome(output_name, state, layout)?;
             return Ok(layout);
+        }
+
+        let quality_mode = self.graphics_config.quality;
+        let adaptive_quality = should_adapt_quality(
+            quality_mode.adaptive_quality(),
+            quality_mode.adaptive_navigation(),
+            navigation_refine,
+            self.kitty_adaptive_damage,
+            self.kitty_force_max_quality,
+        );
+        if !adaptive_quality && !self.kitty_quality.is_maximum() {
+            self.kitty_quality.reset();
+            self.kitty_quality_upgrade_at = None;
         }
 
         let atlas_crop = self.kitty_atlas.as_ref().map(|atlas| {
@@ -1775,7 +2033,8 @@ impl Terminal {
                 .clone();
             let segments = candidate.encode_tiles(&tiles, reset)?;
             let encoded_bytes = segments.iter().map(Vec::len).sum();
-            if candidate.is_tmux()
+            if adaptive_quality
+                && candidate.is_tmux()
                 && encoded_bytes > self.kitty_frame_budget_bytes
                 && self
                     .kitty_quality
@@ -1799,12 +2058,15 @@ impl Terminal {
             self.kitty_previewing = false;
             self.force_kitty_redraw = false;
             self.deferred_kitty_redraw = false;
+            self.kitty_force_max_quality = false;
             self.draw_chrome(output_name, state, layout)?;
             return Ok(layout);
         };
         *self.kitty.as_mut().expect("Kitty renderer was selected") = candidate;
         if quality_reduced {
-            self.kitty_quality_upgrade_at = Some(Instant::now() + KITTY_QUALITY_RECOVERY_DELAY);
+            self.kitty_quality_upgrade_at = Some(
+                Instant::now() + Duration::from_millis(self.graphics_config.advanced.recovery_ms),
+            );
         }
         if let Some(previous_layout) = previous_layout
             && previous_layout != layout
@@ -1829,11 +2091,15 @@ impl Terminal {
         self.kitty_layout = Some(layout);
         self.kitty_refine_at = None;
         self.kitty_previewing = false;
-        if self.kitty_atlas_stale && layout.is_full_viewport() {
-            self.kitty_atlas_refresh_at = Some(Instant::now() + KITTY_ATLAS_REFRESH_DELAY);
+        if self.kitty_atlas_stale {
+            self.kitty_atlas_refresh_at = Some(
+                Instant::now()
+                    + Duration::from_millis(self.graphics_config.advanced.atlas_refresh_ms),
+            );
         }
         self.force_kitty_redraw = false;
         self.deferred_kitty_redraw = false;
+        self.kitty_force_max_quality = false;
         self.draw_chrome(output_name, state, layout)?;
         Ok(layout)
     }
@@ -1852,56 +2118,47 @@ impl Terminal {
         &mut self,
         output_name: &str,
         state: &ViewerState,
-        layout: DrawLayout,
+        _layout: DrawLayout,
     ) -> Result<()> {
         let (cols, rows) = crossterm::terminal::size()?;
         let mode_y = rows.saturating_sub(2);
         let mode = match state.mode {
-            InteractionMode::Nav => "NAV",
-            InteractionMode::Input => "INPUT",
+            InteractionMode::Nav => "Navigation",
+            InteractionMode::Input => "Keyboard",
         };
         let mouse = if !state.control {
-            "READ-ONLY"
+            "View only"
         } else if state.mouse_armed {
-            "MOUSE:ON"
+            "Mouse on"
         } else {
-            "MOUSE:OFF"
-        };
-        let scroll = match state.scroll_target {
-            ScrollTarget::View => "SCROLL:VIEW",
-            ScrollTarget::Desktop => "SCROLL:DESKTOP",
-        };
-        let idle = if state.idle_inhibited {
-            "IDLE:BLOCK"
-        } else {
-            "IDLE:NORMAL"
+            "Mouse off"
         };
         let graphics = if self.kitty.is_some() {
             if self.kitty_previewing {
-                "KITTY/PREVIEW".to_owned()
+                format!("{} loading", self.kitty_quality.ceiling_label())
             } else {
-                format!("KITTY/{}", self.kitty_quality.label())
+                format!(
+                    "{} {}",
+                    self.kitty_quality.label(),
+                    self.graphics_config.quality.label()
+                )
             }
         } else {
             state.graphics_backend.to_owned()
         };
-        let input_hint = if state.mode == InteractionMode::Input {
-            "C-\\ prefix"
-        } else if !state.control {
-            "click focus"
-        } else if state.mouse_armed {
-            "i disarm"
+        let scroll = (state.scroll_target == ScrollTarget::Desktop).then_some(" · Desktop scroll");
+        let idle = state.idle_inhibited.then_some(" · Keep awake");
+        let help = if state.mode == InteractionMode::Input {
+            "C-\\ ? Help"
         } else {
-            "click focus  i arm"
+            "? Help"
         };
         let mode_line = fit_status(
             &format!(
-                " - Termway: {output_name}  [{mode} | {mouse} | {scroll} | {idle} | GFX:{graphics}]  {:.2}x  ({:.0}%,{:.0}%)  {}x{}  {input_hint}  a idle  r refresh  q quit ",
+                " Termway · {output_name} · {mode} · {:.2}× · {graphics} · {mouse}{}{} · {help} ",
                 state.viewport.zoom,
-                state.viewport.center_x * 100.0,
-                state.viewport.center_y * 100.0,
-                layout.cols,
-                layout.rows,
+                scroll.unwrap_or(""),
+                idle.unwrap_or(""),
             ),
             cols as usize,
         );
@@ -1932,9 +2189,11 @@ impl Terminal {
             return Ok(());
         }
         let echo_y = rows - 1;
-        let palette_echo = state.palette_echo();
+        let modal_echo = self
+            .display_settings_echo(state)
+            .or_else(|| state.palette_echo());
         let echo = fit_status(
-            palette_echo.as_deref().unwrap_or_else(|| {
+            modal_echo.as_deref().unwrap_or_else(|| {
                 state
                     .message
                     .as_ref()
@@ -1955,6 +2214,32 @@ impl Terminal {
         self.write_control(bytes)?;
         self.last_echo = Some(signature);
         Ok(())
+    }
+
+    fn display_settings_echo(&self, state: &ViewerState) -> Option<String> {
+        let settings = state.display_settings.as_ref()?;
+        if self.kitty.is_none() {
+            return Some(
+                "Display settings · unavailable with ANSI graphics · Enter close".to_owned(),
+            );
+        }
+        let value = match settings.selected {
+            DisplaySetting::Quality => {
+                let quality = self.graphics_config.quality;
+                format!(
+                    "Quality  ‹ {} › — {}",
+                    quality.label(),
+                    quality.description()
+                )
+            }
+            DisplaySetting::Resolution => format!(
+                "Resolution  ‹ {} › — maximum detail",
+                self.kitty_quality.ceiling_label()
+            ),
+        };
+        Some(format!(
+            "Display settings · {value} · ↑↓ choose · ←→ change · Enter done"
+        ))
     }
 
     fn write_control(&mut self, bytes: Vec<u8>) -> Result<()> {
@@ -2128,18 +2413,6 @@ struct DrawLayout {
     source_height: u32,
 }
 
-impl DrawLayout {
-    fn is_full_viewport(self) -> bool {
-        self.viewport
-            == (ViewportRect {
-                x: 0,
-                y: 0,
-                width: self.source_width,
-                height: self.source_height,
-            })
-    }
-}
-
 struct KittyImageCache {
     layout: DrawLayout,
     image: RgbImage,
@@ -2156,42 +2429,104 @@ struct KittyAtlasCache {
     cell_height: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct KittyQuality {
     tier: usize,
+    ceiling: usize,
+    limits: Vec<(u32, u32)>,
 }
 
 impl KittyQuality {
-    fn limits(&self) -> (u32, u32) {
-        let height = KITTY_QUALITY_HEIGHTS[self.tier];
-        (KITTY_MAX_WIDTH * height / KITTY_MAX_HEIGHT, height)
-    }
-
-    fn label(&self) -> &'static str {
-        match KITTY_QUALITY_HEIGHTS[self.tier] {
-            1080 => "1080p",
-            900 => "900p",
-            720 => "720p",
-            540 => "540p",
-            360 => "360p",
-            _ => unreachable!("all Kitty quality tiers have labels"),
+    fn new(max_width: u32, max_height: u32, min_height: u32) -> Self {
+        let mut limits = Vec::new();
+        for (numerator, denominator) in [(1, 1), (5, 6), (2, 3), (1, 2), (1, 3)] {
+            let width = scale_dimension(max_width, numerator, denominator);
+            let height = scale_dimension(max_height, numerator, denominator);
+            if height >= min_height && limits.last() != Some(&(width, height)) {
+                limits.push((width, height));
+            }
+        }
+        if limits
+            .last()
+            .is_some_and(|(_, height)| *height > min_height)
+        {
+            let width = ((u64::from(max_width) * u64::from(min_height) / u64::from(max_height))
+                as u32)
+                .max(1);
+            limits.push((width, min_height));
+        }
+        debug_assert!(!limits.is_empty());
+        Self {
+            tier: 0,
+            ceiling: 0,
+            limits,
         }
     }
 
+    fn limits(&self) -> (u32, u32) {
+        self.limits[self.tier]
+    }
+
+    fn label(&self) -> String {
+        let (width, height) = self.limits();
+        if u64::from(width) * 9 == u64::from(height) * 16 {
+            format!("{height}p")
+        } else {
+            format!("{width}x{height}")
+        }
+    }
+
+    fn ceiling_limits(&self) -> (u32, u32) {
+        self.limits[self.ceiling]
+    }
+
+    fn ceiling_label(&self) -> String {
+        let (width, height) = self.ceiling_limits();
+        if u64::from(width) * 9 == u64::from(height) * 16 {
+            format!("{height}p")
+        } else {
+            format!("{width}x{height}")
+        }
+    }
+
+    fn lower_ceiling(&mut self) -> bool {
+        if self.ceiling + 1 >= self.limits.len() {
+            return false;
+        }
+        self.ceiling += 1;
+        self.tier = self.ceiling;
+        true
+    }
+
+    fn raise_ceiling(&mut self) -> bool {
+        if self.ceiling == 0 {
+            return false;
+        }
+        self.ceiling -= 1;
+        self.tier = self.ceiling;
+        true
+    }
+
     fn is_maximum(&self) -> bool {
-        self.tier == 0
+        self.tier == self.ceiling
     }
 
     fn reset(&mut self) {
-        self.tier = 0;
+        self.tier = self.ceiling;
+    }
+
+    fn select_lowest(&mut self) {
+        self.tier = self.limits.len() - 1;
     }
 
     fn reduce_for(&mut self, encoded_bytes: usize, frame_budget_bytes: usize) -> bool {
         let initial = self.tier;
-        while self.tier + 1 < KITTY_QUALITY_HEIGHTS.len() {
-            let current = KITTY_QUALITY_HEIGHTS[initial] as u64;
-            let candidate = KITTY_QUALITY_HEIGHTS[self.tier + 1] as u64;
-            let projected = encoded_bytes as u64 * candidate * candidate / (current * current);
+        let (initial_width, initial_height) = self.limits[initial];
+        let initial_pixels = u64::from(initial_width) * u64::from(initial_height);
+        while self.tier + 1 < self.limits.len() {
+            let (candidate_width, candidate_height) = self.limits[self.tier + 1];
+            let candidate_pixels = u64::from(candidate_width) * u64::from(candidate_height);
+            let projected = encoded_bytes as u64 * candidate_pixels / initial_pixels;
             self.tier += 1;
             if projected <= frame_budget_bytes as u64 {
                 break;
@@ -2199,14 +2534,55 @@ impl KittyQuality {
         }
         self.tier != initial
     }
+}
 
-    fn upgrade(&mut self) -> bool {
-        if self.tier == 0 {
-            false
+fn scale_dimension(value: u32, numerator: u32, denominator: u32) -> u32 {
+    ((u64::from(value) * u64::from(numerator) / u64::from(denominator)) as u32).max(1)
+}
+
+fn should_adapt_quality(
+    adaptive_quality: bool,
+    adaptive_navigation: bool,
+    navigation_refine: bool,
+    adaptive_damage: bool,
+    force_max_quality: bool,
+) -> bool {
+    adaptive_quality
+        && !force_max_quality
+        && if navigation_refine {
+            adaptive_navigation
         } else {
-            self.tier -= 1;
-            true
+            adaptive_damage
         }
+}
+
+fn next_damage_streak(
+    current: u32,
+    previous_at: Option<Instant>,
+    now: Instant,
+    window: Duration,
+) -> u32 {
+    if previous_at.is_some_and(|previous| now.duration_since(previous) <= window) {
+        current.saturating_add(1)
+    } else {
+        1
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtlasNavigation {
+    Preview,
+    WaitForUpload,
+    RefineCurrentFrame,
+}
+
+fn atlas_navigation(atlas_ready: bool, atlas_stale: bool) -> AtlasNavigation {
+    if atlas_stale {
+        AtlasNavigation::RefineCurrentFrame
+    } else if atlas_ready {
+        AtlasNavigation::Preview
+    } else {
+        AtlasNavigation::WaitForUpload
     }
 }
 
@@ -2665,6 +3041,52 @@ mod tests {
     }
 
     #[test]
+    fn display_settings_group_quality_and_resolution_behind_one_key() {
+        let mut state = ViewerState::new(Viewport::default(), false).unwrap();
+        assert_eq!(state.handle_key(key(KeyCode::Char('g'))), Effect::Chrome);
+        assert_eq!(
+            state.display_settings.as_ref().unwrap().selected,
+            DisplaySetting::Quality
+        );
+        assert_eq!(
+            state.handle_key(key(KeyCode::Right)),
+            Effect::Graphics(GraphicsCommand::NextQualityMode)
+        );
+        assert_eq!(state.handle_key(key(KeyCode::Down)), Effect::Chrome);
+        assert_eq!(
+            state.display_settings.as_ref().unwrap().selected,
+            DisplaySetting::Resolution
+        );
+        assert_eq!(
+            state.handle_key(key(KeyCode::Left)),
+            Effect::Graphics(GraphicsCommand::LowerResolution)
+        );
+        assert_eq!(state.handle_key(key(KeyCode::Enter)), Effect::Chrome);
+        assert!(state.display_settings.is_none());
+    }
+
+    #[test]
+    fn help_is_discoverable_in_navigation_and_through_the_input_prefix() {
+        let mut state = ViewerState::new(Viewport::default(), true).unwrap();
+        assert_eq!(state.handle_key(key(KeyCode::Char('?'))), Effect::Chrome);
+        assert!(state.message.as_ref().unwrap().text.contains("g display"));
+
+        state.mode = InteractionMode::Input;
+        let prefix = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(prefix), Effect::Chrome);
+        assert_eq!(state.handle_key(key(KeyCode::Char('?'))), Effect::Chrome);
+        assert!(
+            state
+                .message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("C-\\ g display")
+        );
+        assert_eq!(state.mode, InteractionMode::Input);
+    }
+
+    #[test]
     fn encodes_ascii_navigation_and_modifiers_as_evdev_keys() {
         assert_eq!(
             encode_key(key(KeyCode::Char('A'))),
@@ -3012,17 +3434,76 @@ mod tests {
     }
 
     #[test]
-    fn kitty_quality_jumps_to_a_frame_budget_and_recovers_gradually() {
-        let mut quality = KittyQuality::default();
+    fn kitty_quality_jumps_to_a_frame_budget_and_resets_after_idle() {
+        let mut quality = KittyQuality::new(1920, 1080, 360);
         assert_eq!(quality.limits(), (1920, 1080));
         assert!(quality.reduce_for(6_000_000, 1_100_000));
         assert_eq!(quality.label(), "360p");
-        assert!(quality.upgrade());
-        assert_eq!(quality.label(), "540p");
+        quality.reset();
+        assert_eq!(quality.label(), "1080p");
 
-        let mut moderate = KittyQuality::default();
+        let mut moderate = KittyQuality::new(1920, 1080, 360);
         assert!(moderate.reduce_for(1_500_000, 1_100_000));
         assert_eq!(moderate.label(), "900p");
+    }
+
+    #[test]
+    fn kitty_quality_scales_custom_resolution_and_respects_its_floor() {
+        let mut quality = KittyQuality::new(2560, 1600, 800);
+        assert_eq!(quality.limits(), (2560, 1600));
+        assert_eq!(quality.label(), "2560x1600");
+        quality.select_lowest();
+        assert_eq!(quality.limits(), (1280, 800));
+        assert_eq!(quality.label(), "1280x800");
+    }
+
+    #[test]
+    fn runtime_resolution_cap_is_the_new_adaptive_ceiling() {
+        let mut quality = KittyQuality::new(1920, 1080, 360);
+        assert!(quality.lower_ceiling());
+        assert_eq!(quality.ceiling_label(), "900p");
+        quality.select_lowest();
+        quality.reset();
+        assert_eq!(quality.label(), "900p");
+        assert!(quality.raise_ceiling());
+        assert_eq!(quality.ceiling_label(), "1080p");
+        assert_eq!(quality.label(), "1080p");
+        assert!(!quality.raise_ceiling());
+    }
+
+    #[test]
+    fn adaptive_quality_skips_navigation_by_default() {
+        assert!(should_adapt_quality(true, false, false, true, false));
+        assert!(!should_adapt_quality(true, false, true, true, false));
+        assert!(should_adapt_quality(true, true, true, false, false));
+        assert!(!should_adapt_quality(true, false, false, false, false));
+        assert!(!should_adapt_quality(true, true, false, true, true));
+        assert!(!should_adapt_quality(false, true, false, true, false));
+    }
+
+    #[test]
+    fn adaptive_damage_streak_requires_nearby_frames() {
+        let started = Instant::now();
+        let window = Duration::from_millis(500);
+        assert_eq!(next_damage_streak(0, None, started, window), 1);
+        assert_eq!(
+            next_damage_streak(
+                1,
+                Some(started),
+                started + Duration::from_millis(200),
+                window
+            ),
+            2
+        );
+        assert_eq!(
+            next_damage_streak(
+                2,
+                Some(started),
+                started + Duration::from_millis(501),
+                window
+            ),
+            1
+        );
     }
 
     #[test]
@@ -3038,5 +3519,22 @@ mod tests {
         assert!(refine_improves_atlas(false, Some(crop), (1280, 720)));
         assert!(refine_improves_atlas(true, Some(crop), (640, 360)));
         assert!(refine_improves_atlas(false, None, (640, 360)));
+    }
+
+    #[test]
+    fn navigation_never_previews_a_stale_atlas() {
+        assert_eq!(atlas_navigation(true, false), AtlasNavigation::Preview);
+        assert_eq!(
+            atlas_navigation(false, false),
+            AtlasNavigation::WaitForUpload
+        );
+        assert_eq!(
+            atlas_navigation(true, true),
+            AtlasNavigation::RefineCurrentFrame
+        );
+        assert_eq!(
+            atlas_navigation(false, true),
+            AtlasNavigation::RefineCurrentFrame
+        );
     }
 }
