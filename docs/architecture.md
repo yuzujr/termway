@@ -39,6 +39,10 @@ then maps to output logical coordinates.
 
 ## Interaction design constraints
 
+The interaction model is informed by Emacs and Vim: a persistent two-line
+footer in the style of Emacs's mode line and echo area, modal
+Navigation/Keyboard states, and `hjkl` panning.
+
 termway is a short-session, use-it-and-leave-it tool. The interface uses
 progressive disclosure and does not expect the user to remember a full state
 machine:

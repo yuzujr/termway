@@ -28,6 +28,11 @@ locally.
 Viewing and controlling a NixOS desktop over SSH, inside a tmux pane:
 <img width="2168" height="1320" alt="Clipboard_Screenshot_1786869949" src="https://github.com/user-attachments/assets/1134454e-19f7-4886-b1fc-ba0ecaef6d37" />
 
+## Design
+
+The two-line status and message footer follows Emacs's mode-line and echo-area
+layout; panning reuses Vim's `hjkl`, and Navigation vs Keyboard mode is a
+Vim-style modal split.
 
 ## Requirements
 
