@@ -103,10 +103,8 @@ never mixed.
 
 The first round used `grim` to quickly answer three questions: whether an SSH
 session can find the active Wayland display, what the screenshot latency is,
-and how legible a scaled, terminal-rendered image is.
-
-Once validated, the implementation moved to `zwlr_screencopy_manager_v1`,
-keeping grim as the automatic fallback:
+and how legible a scaled, terminal-rendered image is. Once validated, the
+implementation moved to `zwlr_screencopy_manager_v1`:
 
 - niri supports wlr-screencopy v3;
 - capture works per output or region;

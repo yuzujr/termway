@@ -185,22 +185,16 @@ pub fn run(
         options.niri_socket,
         options.environment,
     );
-    let mut capturer = capture::Capturer::new(runtime_dir, wayland_display, output_name);
+    let mut capturer = capture::Capturer::new(runtime_dir, wayland_display, output_name)?;
     let mut frame = capturer.capture()?;
-    if let Some(reason) = capturer.fallback_reason() {
-        state.message(format!("Using grim fallback: {reason}"));
-    }
-    let mut damage_watcher = if capturer.backend_name() == "wlr-screencopy" {
+    let mut damage_watcher =
         match capture::DamageWatcher::spawn(runtime_dir, wayland_display, output_name) {
             Ok(watcher) => Some(watcher),
             Err(error) => {
                 state.message(format!("Live updates disabled: {error:#}"));
                 None
             }
-        }
-    } else {
-        None
-    };
+        };
     validate_output_geometry(&frame, &output_geometry)?;
     let pointer = options
         .control

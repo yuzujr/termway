@@ -17,7 +17,7 @@ locally.
 - Local side needs only an SSH client and a terminal emulator
 - No open network ports; the SSH PTY is the only remote transport
 - Runs as a normal fullscreen terminal program, including inside tmux
-- `wlr-screencopy` capture with automatic `grim` fallback
+- `wlr-screencopy` capture with damage tracking
 - Kitty Graphics Protocol with source-crop navigation; ANSI fallback
 - One viewer per output (multi-monitor = one viewer per output)
 - Config-driven action palette
@@ -47,7 +47,6 @@ Add the flake and install the package:
 }
 ```
 
-The package wraps `grim` (termway's screencopy fallback) into its own PATH;
 `tmux` and `systemctl` are read from the host environment.
 
 ## Quick start

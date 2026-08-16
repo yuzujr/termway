@@ -14,7 +14,7 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = (pkgs.rustPlatform.buildRustPackage {
+          default = pkgs.rustPlatform.buildRustPackage {
             pname = "termway";
             version = "0.1.0";
             src = nixpkgs.lib.cleanSource ./.;
@@ -27,15 +27,7 @@
               mainProgram = "termway";
               platforms = platforms.linux;
             };
-          }).overrideAttrs (old: {
-            # grim is termway's documented screencopy fallback; keep it on PATH
-            # so `termway capture` is self-contained after installation.
-            nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.makeWrapper ];
-            postFixup = (old.postFixup or "") + ''
-              wrapProgram "$out/bin/termway" \
-                --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.grim ]}"
-            '';
-          });
+          };
         });
 
       devShells = forAllSystems (system:
@@ -47,7 +39,6 @@
             packages = with pkgs; [
               cargo
               clippy
-              grim
               pkg-config
               rustc
               rustfmt

@@ -253,7 +253,7 @@ fn capture(
         .max(1);
 
     let started = std::time::Instant::now();
-    let mut capturer = capture::Capturer::new(&discovered.runtime_dir, display, &output);
+    let mut capturer = capture::Capturer::new(&discovered.runtime_dir, display, &output)?;
     let frame = capturer.capture()?;
     let capture_elapsed = started.elapsed();
 
@@ -273,8 +273,7 @@ fn capture(
     io::stdout().write_all(&rendered.bytes)?;
     io::stdout().flush()?;
     eprintln!(
-        "termway: output={output}, backend={}, capture={}x{} in {:.1?}, viewport={}x{}+{},{} zoom={:.2}x, render={}x{} cells/{} bytes in {:.1?}",
-        capturer.backend_name(),
+        "termway: output={output}, capture={}x{} in {:.1?}, viewport={}x{}+{},{} zoom={:.2}x, render={}x{} cells/{} bytes in {:.1?}",
         frame.width(),
         frame.height(),
         capture_elapsed,

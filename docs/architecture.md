@@ -26,7 +26,7 @@ src/
   kitty.rs       Kitty transport, tiles, atlas, tmux relative placements
   render.rs      half-block, cell diff, raster/viewport/tile
   screencopy.rs  wlr-screencopy session and buffer reuse
-  capture.rs     damage watcher, native capture and grim fallback
+  capture.rs     damage watcher and native capture
   input.rs       Wayland virtual pointer/keyboard
   niri.rs        JSON IPC and output geometry
   config.rs      user graphics config, action palette, process environment
@@ -59,11 +59,10 @@ machine:
 
 Shows the target output or viewport. The current version captures the full
 output through a persistent wlr-screencopy Wayland connection and reuses a
-`wl_shm` buffer across frames; when the protocol is unavailable it falls back
-to grim. Zoom, pan and pane resize only cause local redraws; press `r` to
-re-capture manually. When the native damage watcher is available, clicks and
-keyboard input no longer trigger an extra capture; the grim fallback path uses
-click refresh and keyboard debounce instead. Continuous mode runs
+`wl_shm` buffer across frames. Zoom, pan and pane resize only cause local
+redraws; press `r` to re-capture manually. When the native damage watcher is
+available, clicks and keyboard input no longer trigger an extra capture.
+Continuous mode runs
 `copy_with_damage` on a separate Wayland connection at up to 5 FPS; the main
 thread only polls a single latest-frame slot that overwrites the previous
 value, so slow SSH output never queues up frames. Manual capture still uses an
