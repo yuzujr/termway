@@ -23,6 +23,12 @@ locally.
 - Config-driven action palette
 - Optional remote mouse and keyboard control (`--control`)
 
+## Screenshot
+
+Viewing and controlling a NixOS desktop over SSH, inside a tmux pane:
+<img width="2168" height="1320" alt="Clipboard_Screenshot_1786869949" src="https://github.com/user-attachments/assets/1134454e-19f7-4886-b1fc-ba0ecaef6d37" />
+
+
 ## Requirements
 
 - **Local**: any SSH client and terminal emulator
